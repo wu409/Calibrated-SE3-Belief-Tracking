@@ -3,10 +3,11 @@ import glob
 import cv2
 import numpy as np
 import matplotlib.pyplot as plt
+import argparse
 # 使用固定随机种子，保证可复现性
 np.random.seed(42)
 
-def apply_patch_depth_dropout(depth_img, gt_mask, dropout_rate=0.60, patch_size=20):
+def apply_patch_depth_dropout(depth_img, gt_mask, dropout_rate, patch_size=20):
     
     """
     只在物体 gt_mask 区域内，成块挖掉 60% 面积的深度 (Simulating Specular Reflections)
@@ -41,7 +42,7 @@ def apply_patch_depth_dropout(depth_img, gt_mask, dropout_rate=0.60, patch_size=
         
     return depth_corrupted
 
-def generate_patch_corruptions(seq_path, out_base_dir):
+def generate_dropout_corruptions(seq_path, out_base_dir,dropout_rate=0.6):
     seq_name = os.path.basename(seq_path.rstrip('/\\'))
     rgb_files = sorted(glob.glob(os.path.join(seq_path, "rgb", "*.png")))
     depth_files = sorted(glob.glob(os.path.join(seq_path, "depth", "*.png")))
@@ -51,10 +52,10 @@ def generate_patch_corruptions(seq_path, out_base_dir):
     mask_path = mask_files[0]
     gt_mask_img = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
     gt_mask = gt_mask_img > 0
-
+    doc_name = int(dropout_rate*10)
     
-    print(f"正在为序列 {seq_name} 生成 40% 块状深度缺失数据集...")
-    dir_drop = os.path.join(out_base_dir, f"{seq_name}_drop40")
+    print(f"正在为序列 {seq_name} 生成块状深度缺失数据集...")
+    dir_drop = os.path.join(out_base_dir, f"{seq_name}_{doc_name}")
     os.makedirs(os.path.join(dir_drop, "rgb"), exist_ok=True)
     os.makedirs(os.path.join(dir_drop, "depth"), exist_ok=True)
 
@@ -68,29 +69,28 @@ def generate_patch_corruptions(seq_path, out_base_dir):
         else:
             gt_mask = (depth > 400) & (depth < 1100) # 40cm~1.1m
 
-        # 应用 40% 块状深度缺失 (Patch Dropout)
-        depth_corrupted = apply_patch_depth_dropout(depth, gt_mask, dropout_rate=0.40, patch_size=20)
+        # 应用块状深度缺失 (Patch Dropout)
+        depth_corrupted = apply_patch_depth_dropout(depth, gt_mask, dropout_rate=dropout_rate, patch_size=20)
         
         cv2.imwrite(os.path.join(dir_drop, "rgb", os.path.basename(rgb_files[i])), rgb) # RGB 保持原样
         cv2.imwrite(os.path.join(dir_drop, "depth", os.path.basename(depth_files[i])), depth_corrupted)
 
-    print(f"序列 {seq_name}_drop40 块状深度受损数据集成功生成！")
+    print(f"序列 {seq_name}_{doc_name}块状深度受损数据集成功生成！")
 
 
 
-def generate_harry_corruptions(seq_path, out_base_dir):
+def generate_corruptions(seq_path, out_base_dir,occlusion_rate=0.6):
     seq_name = os.path.basename(seq_path.rstrip('/\\'))
     rgb_files = sorted(glob.glob(os.path.join(seq_path, "rgb_clean", "*.png")))
     depth_files = sorted(glob.glob(os.path.join(seq_path, "depth_clean", "*.png")))
     mask_files =   sorted(glob.glob(os.path.join(seq_path, "gt_mask", "*.png")))
-    print(f"正在严格按照 Harry 的规范为序列 {seq_name} 生成 3 套受损数据集...")
+    print(f"正在为序列 {seq_name} 生成 3 套受损数据集...")
     
     # 建立 3 个独立的受损输出文件夹
     dir_occ = os.path.join(out_base_dir, f"{seq_name}_occ60")
-    dir_drop = os.path.join(out_base_dir, f"{seq_name}_drop60")
     dir_black = os.path.join(out_base_dir, f"{seq_name}_black10")
     
-    for d in [dir_occ, dir_drop, dir_black]:
+    for d in [dir_occ, dir_black]:
         os.makedirs(os.path.join(d, "rgb"), exist_ok=True)
         os.makedirs(os.path.join(d, "depth"), exist_ok=True)
 
@@ -104,7 +104,7 @@ def generate_harry_corruptions(seq_path, out_base_dir):
         rgb_occ = rgb.copy()
         depth_occ = depth.copy()
 
-        if  90 <= i < 290:
+        if  50 <= i < 300:
             gt_mask_img = cv2.imread(mask_files[i], cv2.IMREAD_GRAYSCALE)
             gt_mask = (gt_mask_img > 0)
             
@@ -127,29 +127,6 @@ def generate_harry_corruptions(seq_path, out_base_dir):
         cv2.imwrite(os.path.join(dir_occ, "rgb", os.path.basename(rgb_files[i])), rgb_occ)
         cv2.imwrite(os.path.join(dir_occ, "depth", os.path.basename(depth_files[i])), depth_occ)
 
-        
-        # ---------------- 2. Condition 2: 60% Depth Dropout (只坏深度，不坏RGB) ----------------
-        # depth_drop = depth.copy()
-        
-        # if i < len(mask_files):
-        #     gt_mask_img = cv2.imread(mask_files[i], cv2.IMREAD_GRAYSCALE)
-        #     gt_mask = (gt_mask_img > 0)
-            
-        #     if np.sum(gt_mask) > 0:
-        #         # A. 叠加高斯深度噪声 (让深度测量产生 5cm 的物理抖动误差)
-        #         noise_cm = 5.0 # 5 厘米高斯噪声
-        #         noise = np.random.normal(0, noise_cm * 10, depth.shape) # 毫米单位
-                
-        #         depth_noisy = depth.astype(np.float32) + noise
-        #         depth_noisy = np.clip(depth_noisy, 0, 65535).astype(np.uint16)
-                
-        #         # B. 只在物体的 gt_mask 区域施加高斯噪声和 60% 深度块状缺失
-        #         drop_mask = (np.random.rand(*depth.shape) < 0.60) & gt_mask
-        #         depth_drop[gt_mask] = depth_noisy[gt_mask] # 叠加高斯噪声
-        #         depth_drop[drop_mask] = 0                  # 抹掉 60% 表面深度
-        
-        # cv2.imwrite(os.path.join(dir_drop, "rgb", os.path.basename(rgb_files[i])), rgb) # RGB 完好
-        # cv2.imwrite(os.path.join(dir_drop, "depth", os.path.basename(depth_files[i])), depth_drop)
 
         # ---------------- 3. Condition 3: 10 帧完全黑屏 (第 150~160 帧完全断连) ----------------
         rgb_black = rgb.copy()
@@ -164,14 +141,25 @@ def generate_harry_corruptions(seq_path, out_base_dir):
     print(f"序列 {seq_name} 的受损数据集生成完毕！")
 
 if __name__ == "__main__":
-    dataset_base = "./datasets/YCBInEOAT"
-    out_dir = "./datasets/YCBInEOAT_Corrupted"   
-    sequences = ["mustard0","bleach_hard_00_03_chaitanya","bleach0"]#,   "mustard0" and 80 <= i < 280: "bleach0" and 150 <= i < 350:   "bleach_hard_00_03_chaitanya" and 40 <= i < 240:
+    
+    parser = argparse.ArgumentParser(description="生成 YCBInEOAT 受损数据集")
+    parser.add_argument('--dataset_base', type=str, default="./datasets/YCBInEOAT", help="原始数据集基础路径")
+    parser.add_argument('--out_dir', type=str, default="./datasets/YCBInEOAT_Corrupted", help="受损数据集输出路径")
+    parser.add_argument('--sequences', nargs='+', default=["mustard0", "bleach_hard_00_03_chaitanya", "bleach0"], help="要处理的序列名称列表")
+    parser.add_argument('--occlusion_rate', type=float, default=0.6, help="遮挡率")
+    parser.add_argument('--dropout_rate', type=float, default=0.6, help="dropout率")
+    args = parser.parse_args()
+    dataset_base = args.dataset_base
+    out_dir = args.out_dir
+    sequences = args.sequences
+    occlusion_rate = args.occlusion_rate
+    dropout_rate = args.dropout_rate
+
     for seq in sequences:
         seq_p = os.path.join(dataset_base, seq)
         if os.path.exists(seq_p):
-            generate_harry_corruptions(seq_p, out_dir)
-            generate_patch_corruptions(seq_p, out_dir)
+            generate_corruptions(seq_p, out_dir,occlusion_rate)
+            generate_dropout_corruptions(seq_p, out_dir,dropout_rate)
 
 
 #=========================================以下为验证代码==================================

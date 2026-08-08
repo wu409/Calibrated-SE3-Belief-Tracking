@@ -1,8 +1,8 @@
 Step1 Generating corruption datasets:
 '''
-python 0-corruption.py
+python 0-corruption.py --dataset_base ./datasets/YCBInEOAT --out_dir ./datasets/YCBInEOAT_Corrupted --sequences mustard0 bleach_hard_00_03_chaitanya bleach0 --occlusion_rate 0.6 --dropout_rate 0.6
 '''
-There are some parameters can be choosen.
+
 
 Step2: Run SE(3)TrackNet predition.py to generates predictions in ./results/bleach0/, using the datasets you want to predict:
 '''
@@ -16,19 +16,16 @@ python eval_ycbineoat.py --YCBInEOAT_dir ./datasets/YCBInEOAT --class_id 12 --yc
 
 
 Step4:  Extracting reliability feature and  labeling
-'''python 1-harm_label.py
+'''python 1-harm_label.py --ycb_dir ./datasets/YCBInEOAT --data_dir ./datasets/YCBInEOAT_Corrupted --res_dir ./results_collection --mesh_path_root ./datasets/YCB_Video_Models/CADmodels --target_seqs mustard0 bleach_hard_00_03_chaitanya bleach0 --corruption_lists  _occ40 _black10 _clean _drop60 _occ60 --cad_models_seq 021_bleach_cleanser 021_bleach_cleanser 006_mustard_bottle --delta 0.1
 '''
 
 
-Step5: Analysing the harm predictor
+Step5: Train and evaluation
 '''
-python 2-risk_model_train.py
+python 2-train_evaluation.py --csv_path ./per_frame_help_dataset_delta0.csv --result_dir ./results_collection/bleach_hard_00_03_chaitanya/bleach_hard_00_03_chaitanya_black10 --gt_dir ./datasets/YCBInEOAT/bleach_hard_00_03_chaitanya/annotated_poses --point_path ./datasets/YCB_Video_Models/CADmodels/021_bleach_cleanser/points.xyz --train_seqs bleach0 mustard0 --test_base_seq bleach_hard_00_03_chaitanya --p_help_threshold 0.60 --alpha 0.5	
 '''
 
-Step 6: Experimental Verification
-'''
-python 3-evaluation.py
-'''
+
 
 
 
