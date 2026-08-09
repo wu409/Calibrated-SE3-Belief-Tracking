@@ -17,7 +17,7 @@ python eval_ycbineoat.py --YCBInEOAT_dir ./datasets/YCBInEOAT --class_id 12 --yc
 
 Step4:  Extracting reliability feature and  labeling
 '''
-python 1-help_label.py --ycb_dir ./datasets/YCBInEOAT --data_dir ./datasets/YCBInEOAT_Corrupted --res_dir ./results_collection --mesh_path_root ./datasets/YCB_Video_Models/CADmodels --target_seqs mustard0 bleach_hard_00_03_chaitanya bleach0 --corruption_lists  _occ40 _black10 _clean _drop60 _occ60 --cad_models_seq 006_mustard_bottle 021_bleach_cleanser 021_bleach_cleanser  --delta 0.1
+python 1-help_label.py --ycb_dir ./datasets/YCBInEOAT --data_dir ./datasets/YCBInEOAT_Corrupted --res_dir ./results_collection --mesh_path_root ./datasets/YCB_Video_Models/CADmodels --target_seqs mustard0 bleach_hard_00_03_chaitanya bleach0 --corruption_lists  _occ40 _black10 _clean _drop60 _occ60 --cad_models_seq 006_mustard_bottle 021_bleach_cleanser 021_bleach_cleanser  --delta 0.0
 '''
 
 
