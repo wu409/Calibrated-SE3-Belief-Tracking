@@ -610,7 +610,10 @@ def predictSequenceYcbInEOAT():
     A_in_cam = prev_pose.copy()
     cur_pose = tracker.on_track(A_in_cam, rgb, depth, gt_A_in_cam=np.eye(4),gt_B_in_cam=np.eye(4), debug=debug,samples=samples)
     prev_pose = cur_pose.copy()
-    np.savetxt(out_dir+'%07d.txt'%(i),cur_pose)
+    gt_filename = os.path.basename(gt_files[i])
+    frame_id = os.path.splitext(gt_filename)[0]
+    # 按真实 frame ID 保存 prediction
+    np.savetxt(os.path.join(out_dir, f"{frame_id}.txt"),cur_pose)
     model = copy.deepcopy(tracker.object_cloud)
     model.transform(cur_pose)
     uvs = project_points(np.asarray(model.points),K)

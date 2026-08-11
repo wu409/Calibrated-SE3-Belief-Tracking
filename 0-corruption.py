@@ -133,7 +133,7 @@ def generate_corruptions(seq_path, out_base_dir,occlusion_rate):
         # ---------------- 3. Condition 3: 10 帧完全黑屏 (第 150~160 帧完全断连) ----------------
         rgb_black = rgb.copy()
         depth_black = depth.copy()
-        if 45 <= i < 55: # 10 帧全黑
+        if 65 <= i < 75: # 10 帧全黑
             rgb_black[:] = 0    # 视觉完全缺失
             depth_black[:] = 0  # 深度完全缺失
             
@@ -146,8 +146,8 @@ if __name__ == "__main__":
     
     parser = argparse.ArgumentParser(description="生成 YCBInEOAT 受损数据集")
     parser.add_argument('--dataset_base', type=str, default="./datasets/YCBInEOAT", help="原始数据集基础路径")
-    parser.add_argument('--out_dir', type=str, default="./datasets/YCBInEOAT_Corrupted", help="受损数据集输出路径")
-    parser.add_argument('--sequences', nargs='+', default=["mustard0", "bleach_hard_00_03_chaitanya", "bleach0"], help="要处理的序列名称列表")
+    parser.add_argument('--out_dir', type=str, default="./datasets/YCBInEOAT_Corrupted5", help="受损数据集输出路径")
+    parser.add_argument('--sequences', nargs='+', default=[ "mustard0", "bleach0", "bleach_hard_00_03_chaitanya"], help="要处理的序列名称列表")  #
     parser.add_argument('--occlusion_rate', nargs='+',type=float, default=[0.4,0.6], help="遮挡率")
     parser.add_argument('--dropout_rate', type=float, default=0.6, help="dropout率")
     args = parser.parse_args()

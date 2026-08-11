@@ -1,6 +1,8 @@
 import os
 import glob
 import numpy as np
+import open3d as o3d
+import cv2
 import pandas as pd
 import matplotlib.pyplot as plt
 from sklearn.linear_model import LogisticRegression
@@ -13,6 +15,12 @@ from collections import Counter
 from sklearn.metrics import roc_auc_score, precision_recall_curve, auc, brier_score_loss
 import argparse
 from scipy.stats import t
+
+K = np.array([
+    [3.195820007324218750e+02,    0.0,   3.202149847676955687e+02],
+    [   0.0,  4.171186828613281250e+02, 2.443486680871046701e+02],
+    [   0.0,      0.0,     1.0   ]
+], dtype=np.float64)
 
 # ==================== 1. SE(3) 李群辅助函数 ====================
 def se3_log_map(T):
@@ -68,6 +76,43 @@ def compute_episode_level_ci(scores, n_bootstraps=2000, confidence_level=0.95):
 
     return mean_score, lower_bound, upper_bound
 
+def get_frame_id(path):
+
+    filename = os.path.basename(path)
+    frame_id = os.path.splitext(filename)[0]
+    return int(frame_id)
+
+def actual_recovery_action(current_depth_real, T_prior, model_pts_3d, K):
+    z_center = T_prior[2, 3]
+    y_idx, x_idx = np.where((current_depth_real > z_center - 0.2) & (current_depth_real < z_center + 0.2))
+
+    if len(y_idx) < 100:
+        print("recovery的输出为T_prior")
+        return T_prior # 依然全黑，无法恢复，继续听先验
+    
+    z_vals = current_depth_real[y_idx, x_idx]
+    x_c = (x_idx - K[0, 2]) * z_vals / K[0, 0]
+    y_c = (y_idx - K[1, 2]) * z_vals / K[1, 1]
+    camera_pts = np.vstack((x_c, y_c, z_vals)).T
+    
+    pcd_cam = o3d.geometry.PointCloud()
+    pcd_cam.points = o3d.utility.Vector3dVector(camera_pts)
+    
+    # 2. 准备物体的 CAD 点云
+    pcd_obj = o3d.geometry.PointCloud()
+    pcd_obj.points = o3d.utility.Vector3dVector(model_pts_3d)
+    
+    # 以 T_prior 为初始猜测，但在 5cm 范围内自由寻找最佳吻合位置
+    icp_result = o3d.pipelines.registration.registration_icp(
+        pcd_obj, pcd_cam, max_correspondence_distance=0.05,
+        init=T_prior,
+        estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPoint()
+    )
+    print("recovery的输出为T_icp")
+    return icp_result.transformation
+
+
+
 def main(args):
     # ==================== 2. 载入数据集与训练好的风险分类器 ====================
     print("正在载入 CSV 数据集并训练分类器...")
@@ -90,7 +135,10 @@ def main(args):
     train_df = pd.concat(train_dfs)
     cal_df   = pd.concat(cal_dfs)
 
-    test_df = df[df['sequence'].str.contains(test_seq)]
+    test_df = df[df['sequence'].str.contains(test_seq)].copy()
+    test_df['frame_id'] = test_df['frame_id'].astype(int)
+    test_df = test_df.set_index('frame_id')
+
     test_ALL_df = df[df['sequence'].str.contains(args.test_base_seq)]
     
     print(f"训练集包含序列关键词: {args.train_seqs} | 行数: {len(train_df)}")
@@ -132,7 +180,17 @@ def main(args):
 
     # 预测测试集上标定后的连续概率 P(Help) 
     test_probs = 1.0 / (1.0 + np.exp(-(test_logits / temp_factor)))
+    p_help_dict = dict(zip(test_df.index.tolist(), test_probs.tolist()))
+    support_dict = test_df['x4_support_ratio'].to_dict()
+
     test_probs_ALL = 1.0 / (1.0 + np.exp(-(test_ALL_logits / temp_factor)))
+
+    for fid in list(test_df.index[:10]):
+        print(
+            f"frame_id={fid:4d} | "
+            f"P(help)={p_help_dict[fid]:.4f} | "
+            f"support={support_dict[fid]:.4f}"
+        )
 
 
     # ==================== 3. 计算 4 大概率与标定指标 ====================
@@ -154,20 +212,53 @@ def main(args):
     gt_dir=args.gt_dir
     last_name = os.path.basename(args.result_dir)
 
-    pred_files=sorted(glob.glob(os.path.join(result_dir,"*.txt")))
-    gt_files=sorted(glob.glob(os.path.join(gt_dir,"*.txt")))
+    pred_files=glob.glob(os.path.join(result_dir,"*.txt"))
+    gt_files=glob.glob(os.path.join(gt_dir,"*.txt"))
 
-    assert len(pred_files)==len(gt_files)
+    pred_dict = {get_frame_id(f): f for f in pred_files}
+    gt_dict = {get_frame_id(f): f for f in gt_files}
+
+    depth_files = sorted(glob.glob(f"{args.data_dir}/{last_name}/depth/*.png")) 
+    frame_ids = sorted(gt_dict.keys())
+    depth_dict={}
+    
+    for frame_id, depth_path in zip(frame_ids, depth_files):
+        depth_dict[frame_id]=depth_path
+
+    # 显式求交集
+    matched_frames = sorted(set(pred_dict.keys()) & set(gt_dict.keys()))
+    missing_pred = sorted(set(gt_dict.keys()) - set(pred_dict.keys()))
+    missing_gt = sorted(set(pred_dict.keys()) - set(gt_dict.keys()))
+
+    print("="*50)
+    print(f"GT frames        : {len(gt_dict)}")
+    print(f"Prediction frames: {len(pred_dict)}")
+    print(f"Matched frames   : {len(matched_frames)}")
+    print(f"Missing prediction frames:")
+    print(missing_pred[:20])
+    print(f"Missing GT frames:")
+    print(missing_gt[:20])
+    print("="*50)
+
 
     T_candidates=[]
     T_gts=[]
+    frame_ids=[]
 
-    for pf,gf in zip(pred_files,gt_files):
-        T_candidates.append(np.loadtxt(pf).reshape(4,4))
-        T_gts.append(np.loadtxt(gf).reshape(4,4))
 
-    x4_support = test_df['x4_support_ratio'].values
-    n_frames = len(test_df)
+    for frame_id in matched_frames:
+        pred_path = pred_dict[frame_id]
+        gt_path   = gt_dict[frame_id]
+        T_pred = np.loadtxt(pred_path).reshape(4,4)
+        T_gt   = np.loadtxt(gt_path).reshape(4,4)
+        T_candidates.append(T_pred)
+        T_gts.append(T_gt)
+        frame_ids.append(frame_id)
+  
+
+    T_candidates=np.array(T_candidates)
+    T_gts=np.array(T_gts)
+    frame_ids=np.array(frame_ids)
 
 
     # 定义 6 个 Baselines 最终的逐帧姿态误差结果 (cm)
@@ -180,7 +271,9 @@ def main(args):
     T_history2,T_history3,T_history4,T_history5,T_history6 =  [], [], [], [], []
     blackout_start = 0
     blackout_end = 1e10
-    for i in range(n_frames):
+
+
+    for i, frame_id in enumerate(matched_frames):
 
         if i < 2: 
             T_prior_current2,T_prior_current3,T_prior_current4,T_prior_current5,T_prior_current6 = T_candidates[i],T_candidates[i],T_candidates[i],T_candidates[i],T_candidates[i]  # 初始化阶段
@@ -191,8 +284,8 @@ def main(args):
             T_prior_current5 = compute_se3_prior(T_history5[-1],T_history5[-2])
             T_prior_current6 = compute_se3_prior(T_history6[-1],T_history6[-2])
    
-        p_help = test_probs[i]
-        support = x4_support[i]
+        p_help = p_help_dict[frame_id]
+        support = support_dict[frame_id]
         # B1: Obs-Only 
         #b1_errs.append(e_obs)
         b1_errs.append(U.adi(T_candidates[i],T_gts[i],open3d_model)* 100)
@@ -242,19 +335,20 @@ def main(args):
             #print(p_help)
 
         elif 'exited_blackout' in locals() and exited_blackout:
-            print("恢复帧数",i)
-            #开灯的第一帧，用 T_obs 强行重置姿态复活！
-            current_mode = "MODE_3_RECOVERY_EXECUTE"
-            T_prior = T_prior_current5
-            T_obs = T_candidates[i]
-            innovation = se3_log_map(np.linalg.inv(T_prior) @ T_obs)
-            if p_help > args.p_help_threshold:
-                beta = 0.5   # recovery融合比例
-            else:
-                beta = 0.1   # 视觉不可靠，只小幅修正
-            T_final = (T_prior @ se3_exp_map(beta * innovation))
+            print("恢复帧数",frame_id)
+            # T_recovery, score = cad_global_relocalization(depth_path=depth_dict[frame_id],model_cloud=open3d_model, K=K)
+            # if T_recovery is not None:
+            #     print(f"Recovery success score={score}")
+            #     T_final = T_recovery
+            # else:
+            #     print("Recovery failed, fallback prior", score)
+            #     T_final = T_prior_current5
 
-            exited_blackout = False # 复活完成，标记重置！
+            depth_raw = cv2.imread(depth_dict[frame_id],cv2.IMREAD_UNCHANGED)
+            depth_real = depth_raw.astype(np.float32) / 1000.0
+            T_final = actual_recovery_action(depth_real, T_prior_current5, model_pts, K)
+            
+            exited_blackout=False
 
         # =========================
         # 正常模式
@@ -382,57 +476,11 @@ def main(args):
         # 恢复失败 (黑屏后彻底跟丢)：记录为 N/A (Failed)！
         avg_recovery_latency6  = "N/A (Failed)"
 
-    # ==================== 动作 B: 打印 Table 1 汇总表 ====================
-    # print("\n" + "="*85)
-    # print("TABLE 1: ALL METRICS INCLUDED")
-    # print("="*85)
-
-    # results_table = pd.DataFrame({
-    #     "Baseline / Method": [
-    #         "B1: Obs-Only se(3)-TrackNet",
-    #         "B2: Fixed-Alpha (0.5) Interpolation",
-    #         "B3: Hard Depth Threshold",
-    #         "B4: Robust Huber Weighting",
-    #         "B5: Proposed Three-Mode Policy (Ours)",
-    #         "B6: Oracle Decision Policy (Upper Bound)"
-    #     ],
-    #     "ADD-S AUC (%)": [
-    #         calc_auc(b1_errs), calc_auc(b2_errs), calc_auc(b3_errs),
-    #         calc_auc(b4_errs), calc_auc(b5_errs), calc_auc(b6_errs)
-    #     ],
-    #     "Failure Rate (>2cm %)": [
-    #         np.mean(np.array(b1_errs) > 2.0)*100, np.mean(np.array(b2_errs) > 2.0)*100,
-    #         np.mean(np.array(b3_errs) > 2.0)*100, np.mean(np.array(b4_errs) > 2.0)*100,
-    #         np.mean(np.array(b5_errs) > 2.0)*100, np.mean(np.array(b6_errs) > 2.0)*100
-    #     ],
-    #     "Recovery Latency (Frames)": [
-    #     f"{avg_recovery_latency1} frames", f"{avg_recovery_latency2} frames", f"{avg_recovery_latency3} frames", f"{avg_recovery_latency4} frames", f"{avg_recovery_latency5} frames", f"{avg_recovery_latency6} frames"
-    #     ],
-    #     "False Triggers": [
-    #         "N/A", "N/A", "N/A", "N/A", f"{false_recovery_triggers} times", "0 times"
-    #     ]
-    # })
-
-    # print(results_table.to_string(index=False))
-    # print("="*85)
-
-
-    # print("\n" + "="*50)
-    # print("概率标定与风险预测指标")
-    # print("="*50)
-    # print(f"1. AUROC (风险区分能力):       {auroc:.4f}")
-    # print(f"2. AUPRC (精确召回率):         {auprc:.4f}")
-    # print(f"3. Brier Score (均方概率误差):  {brier:.4f}")
-    # print(f"4. ECE (预期标定误差):         {ece:.4f}")
-    # print(f"5. Temp_Factor:{temp_factor:.4F}")
-    # print("="*50)
-
-
     # ==================== 动作 C: 保存逐帧 CSV 日志与黑屏复活轨迹图 ====================
     # ==================== 6. 保存图像与 CSV 日志 ====================
     # 保存逐帧 CSV 日志
     df_log = pd.DataFrame({
-        "frame_idx": range(len(b5_errs)),
+        "frame_idx": matched_frames,
         "p_help": test_probs[:len(b5_errs)],
         "selected_mode": b5_modes,
         "error_b1_obs_cm": b1_errs,
@@ -492,15 +540,16 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--csv_path', type=str, default="./per_frame_help_dataset_delta0.0.csv", help="csv数据集路径")
     parser.add_argument('--result_dir', nargs='+',type=str, default=["./results_collection/bleach_hard_00_03_chaitanya/bleach_hard_00_03_chaitanya_black10",
-                                                                     "./results_collection/bleach_hard_00_03_chaitanya/bleach_hard_00_03_chaitanya_occ40",
-                                                                     "./results_collection/bleach_hard_00_03_chaitanya/bleach_hard_00_03_chaitanya_occ60",
-                                                                     "./results_collection/bleach_hard_00_03_chaitanya/bleach_hard_00_03_chaitanya_clean",
-                                                                     "./results_collection/bleach_hard_00_03_chaitanya/bleach_hard_00_03_chaitanya_drop60",], 
+                                                                     "./results_collection/bleach_hard_00_03_chaitanya/bleach_hard_00_03_chaitanya_black10_2",
+                                                                     "./results_collection/bleach_hard_00_03_chaitanya/bleach_hard_00_03_chaitanya_black10_3",
+                                                                     "./results_collection/bleach_hard_00_03_chaitanya/bleach_hard_00_03_chaitanya_black10_4",
+                                                                     "./results_collection/bleach_hard_00_03_chaitanya/bleach_hard_00_03_chaitanya_black10_5",], 
                                                                      help="要测试的所有序列路径")
     parser.add_argument('--gt_dir', type=str, default="./datasets/YCBInEOAT/bleach_hard_00_03_chaitanya/annotated_poses", help="GT_Pose Path")
     parser.add_argument('--point_path', type=str, default="./datasets/YCB_Video_Models/CADmodels/021_bleach_cleanser/points.xyz", help="point_path")
     parser.add_argument('--train_seqs', nargs='+', default=["bleach0", "mustard0"], help="训练集包含的序列关键字列表")
     parser.add_argument('--test_base_seq', type=str, default="bleach_hard_00_03_chaitanya", help="测试集物体的基础名称")
+    parser.add_argument('--data_dir', type=str, default="./datasets/YCBInEOAT_Corrupted", help="受损数据集基础路径")
     parser.add_argument('--p_help_threshold', type=float, default=0.50, help="p_help_threshold")
     parser.add_argument('--alpha', type=float, default=0.5, help="B2-alpha")
     parser.add_argument('--delta', type=float, default=0.0, help="delta")
@@ -587,6 +636,7 @@ if __name__ == "__main__":
         print(f"\n✅ 5 大概率标定指标已成功导出为 CSV: {prob_csv_path}")
 
     # 5. 导出为全指标大 CSV 文件
-    csv_out_path = f"./checkpoint2_full_metrics_episode_summary_phelp{args.p_help_threshold}_delta{args.delta}.csv"
+    basename2 = os.path.basename(result_dirs[0])
+    csv_out_path = f"./checkpoint2_full_metrics_episode_summary_{basename2}_phelp{args.p_help_threshold}_delta{args.delta}.csv"
     df_summary.to_csv(csv_out_path, index=False)
     print(f"\n全指标 Episode 级汇总表格已保存为: {csv_out_path}")
