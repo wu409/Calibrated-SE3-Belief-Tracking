@@ -336,14 +336,6 @@ def main(args):
 
         elif 'exited_blackout' in locals() and exited_blackout:
             print("恢复帧数",frame_id)
-            # T_recovery, score = cad_global_relocalization(depth_path=depth_dict[frame_id],model_cloud=open3d_model, K=K)
-            # if T_recovery is not None:
-            #     print(f"Recovery success score={score}")
-            #     T_final = T_recovery
-            # else:
-            #     print("Recovery failed, fallback prior", score)
-            #     T_final = T_prior_current5
-
             depth_raw = cv2.imread(depth_dict[frame_id],cv2.IMREAD_UNCHANGED)
             depth_real = depth_raw.astype(np.float32) / 1000.0
             T_final = actual_recovery_action(depth_real, T_prior_current5, model_pts, K)
