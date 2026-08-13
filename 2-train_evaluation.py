@@ -82,13 +82,16 @@ def get_frame_id(path):
     frame_id = os.path.splitext(filename)[0]
     return int(frame_id)
 
-def actual_recovery_action(current_depth_real, T_prior, model_pts_3d, K):
-    z_center = T_prior[2, 3]
-    y_idx, x_idx = np.where((current_depth_real > z_center - 0.2) & (current_depth_real < z_center + 0.2))
+def actual_recovery_action(current_depth_real, model_pts_3d, K):  
+
+    valid_mask = ((current_depth_real > 0.2) &(current_depth_real < 2.0))
+
+    y_idx, x_idx = np.where(valid_mask) 
 
     if len(y_idx) < 100:
         print("recovery的输出为T_prior")
-        return T_prior # 依然全黑，无法恢复，继续听先验
+        T = False
+        return False # 依然全黑，无法恢复，继续听先验
     
     z_vals = current_depth_real[y_idx, x_idx]
     x_c = (x_idx - K[0, 2]) * z_vals / K[0, 0]
@@ -105,11 +108,12 @@ def actual_recovery_action(current_depth_real, T_prior, model_pts_3d, K):
     # 以 T_prior 为初始猜测，但在 5cm 范围内自由寻找最佳吻合位置
     icp_result = o3d.pipelines.registration.registration_icp(
         pcd_obj, pcd_cam, max_correspondence_distance=0.05,
-        init=T_prior,
+        init=np.eye(4),
         estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPoint()
     )
+    T = True
     print("recovery的输出为T_icp")
-    return icp_result.transformation
+    return icp_result.transformation,T
 
 
 
@@ -123,7 +127,7 @@ def main(args):
     train_df = df[df['sequence'].str.contains(train_pattern)]
 
     matched_train_seqs = df[df['sequence'].str.contains(train_pattern)]['sequence'].unique()  
-    #3. 对匹配到的每一个训练序列，按时间轴切成前 80% (训练) 和 后 20% (校准)
+    #对匹配到的每一个训练序列，按时间轴切成前 80% (训练) 和 后 20% (校准)
     train_dfs, cal_dfs = [], []
     for seq in matched_train_seqs:
         sub_df = df[df['sequence'] == seq]
@@ -135,7 +139,7 @@ def main(args):
     train_df = pd.concat(train_dfs)
     cal_df   = pd.concat(cal_dfs)
 
-    test_df = df[df['sequence'].str.contains(test_seq)].copy()
+    test_df = df[df['sequence'] == test_seq].copy()
     test_df['frame_id'] = test_df['frame_id'].astype(int)
     test_df = test_df.set_index('frame_id')
 
@@ -150,10 +154,20 @@ def main(args):
 
     feature_cols = ['x1_depth_residual', 'x2_inlier_ratio','x3_innovation_mag','x4_support_ratio']
 
-    X_train, y_train = train_df[feature_cols].values, train_df['help_label'].values
-    X_cal, y_cal     = cal_df[feature_cols].values,   cal_df['help_label'].values
-    X_test, y_test = test_df[feature_cols].values, test_df['help_label'].values
-    X_ALL_test, y_ALL_test = test_ALL_df[feature_cols].values, test_ALL_df['help_label'].values
+    X_train = train_df[feature_cols].values
+    X_cal = cal_df[feature_cols].values
+    X_test = test_df[feature_cols].values
+    X_ALL_test = test_ALL_df[feature_cols].values
+
+    y_obs_train = train_df['obs_risk_label'].values
+    y_obs_cal = cal_df['obs_risk_label'].values
+    y_obs_test = test_df['obs_risk_label'].values
+    y_obs_ALL_test = test_ALL_df['obs_risk_label'].values
+
+    y_prior_train = train_df['prior_risk_label'].values
+    y_prior_cal = cal_df['prior_risk_label'].values
+    y_prior_test = test_df['prior_risk_label'].values
+    y_prior_ALL_test = test_ALL_df['prior_risk_label'].values
 
     scaler_x = MinMaxScaler()
     X_train_scaled = scaler_x.fit_transform(X_train)
@@ -161,44 +175,71 @@ def main(args):
     X_test_scaled = scaler_x.transform(X_test)
     X_test_ALL_scaled = scaler_x.transform(X_ALL_test)
 
-    clf = LogisticRegression()
-    clf.fit(X_train_scaled, y_train)
+    clf_obs = LogisticRegression(max_iter=1000)
+    clf_obs.fit(X_train_scaled, y_obs_train)
+
+    clf_prior = LogisticRegression(max_iter=1000)
+    clf_prior.fit(X_train_scaled,y_prior_train)
 
     # 4. 温度缩放标定 (Temperature Scaling，保证概率不盲目自信)
-    cal_logits = clf.decision_function(X_cal_scaled)
-    test_logits = clf.decision_function(X_test_scaled)              #用于测试P(help)
-    test_ALL_logits = clf.decision_function(X_test_ALL_scaled)   #用于绘制ECE、auroc、auprc、brier
+    cal_logits_obs = clf_obs.decision_function(X_cal_scaled)
+    test_logits_obs = clf_obs.decision_function(X_test_scaled)
+    test_ALL_logits_obs = clf_obs.decision_function(X_test_ALL_scaled)   #用于绘制ECE、auroc、auprc、brier
 
-    def eval_loss(t):
-        scaled = cal_logits / t[0]
+    cal_logits_prior = clf_prior.decision_function(X_cal_scaled)
+    test_logits_prior = clf_prior.decision_function(X_test_scaled)
+    test_ALL_logits_prior = clf_prior.decision_function(X_test_ALL_scaled)
+
+
+    def eval_loss_obs(t):
+        scaled = cal_logits_obs / t[0]
         probs = 1.0 / (1.0 + np.exp(-scaled))
         probs = np.clip(probs, 1e-7, 1 - 1e-7)
-        return -np.mean(y_cal * np.log(probs) + (1 - y_cal) * np.log(1 - probs))
+        return -np.mean(y_obs_cal * np.log(probs) + (1 - y_obs_cal) * np.log(1 - probs))
+    
+    def eval_loss_prior(t):
+            scaled = cal_logits_prior / t[0]
+            probs = 1.0 / (1.0 + np.exp(-scaled))
+            probs = np.clip(probs, 1e-7, 1 - 1e-7)
+            return -np.mean(y_prior_cal * np.log(probs) + (1 - y_prior_cal) * np.log(1 - probs))
 
-    res = minimize(eval_loss, [1.0], bounds=[(0.01, 10.0)])
-    temp_factor = res.x[0]
+    res_obs = minimize(eval_loss_obs, [1.0], bounds=[(0.01, 10.0)])
+    temp_factor_obs = res_obs.x[0]
 
-    # 预测测试集上标定后的连续概率 P(Help) 
-    test_probs = 1.0 / (1.0 + np.exp(-(test_logits / temp_factor)))
-    p_help_dict = dict(zip(test_df.index.tolist(), test_probs.tolist()))
+    res_prior = minimize(eval_loss_prior, [1.0], bounds=[(0.01, 10.0)])
+    temp_factor_prior = res_prior.x[0]
+
+    p_obs_bad = 1.0 / (1.0 + np.exp(-(test_logits_obs / temp_factor_obs)))
+    p_obs_bad_ALL = 1.0 / (1.0 + np.exp(-(test_ALL_logits_obs / temp_factor_obs)))
+
+    p_prior_bad = 1.0 / (1.0 + np.exp(-(test_logits_prior / temp_factor_prior)))
+    p_prior_bad_ALL = 1.0 / (1.0 + np.exp(-(test_ALL_logits_prior / temp_factor_prior)))
+
+    p_obs_bad_dict = dict(zip(test_df.index.tolist(),p_obs_bad.tolist()))
+    p_prior_bad_dict = dict(zip(test_df.index.tolist(),p_prior_bad.tolist()))
     support_dict = test_df['x4_support_ratio'].to_dict()
-
-    test_probs_ALL = 1.0 / (1.0 + np.exp(-(test_ALL_logits / temp_factor)))
 
     for fid in list(test_df.index[:10]):
         print(
             f"frame_id={fid:4d} | "
-            f"P(help)={p_help_dict[fid]:.4f} | "
+            f"P(obs_bad)={p_obs_bad_dict[fid]:.4f} | "
+            f"P(prior_bad)={p_prior_bad_dict[fid]:.4f} | "
             f"support={support_dict[fid]:.4f}"
         )
-
-
+    
     # ==================== 3. 计算 4 大概率与标定指标 ====================
-    auroc = roc_auc_score(y_ALL_test, test_probs_ALL)
-    precision, recall, _ = precision_recall_curve(y_ALL_test, test_probs_ALL)
-    auprc = auc(recall, precision)
-    brier = brier_score_loss(y_ALL_test, test_probs_ALL)
-    ece = compute_ece(test_probs_ALL, y_ALL_test)
+    auroc_obs = roc_auc_score(y_obs_ALL_test, p_obs_bad_ALL)
+    precision_obs, recall_obs, _ = precision_recall_curve(y_obs_ALL_test, p_obs_bad_ALL)
+    auprc_obs = auc(recall_obs, precision_obs)
+    brier_obs = brier_score_loss(y_obs_ALL_test, p_obs_bad_ALL)
+    ece_obs = compute_ece(p_obs_bad_ALL,y_obs_ALL_test)
+
+    auroc_prior = roc_auc_score(y_prior_ALL_test, p_prior_bad_ALL)
+    precision_prior, recall_prior, _ = precision_recall_curve(y_prior_ALL_test, p_prior_bad_ALL)
+    auprc_prior = auc(recall_prior, precision_prior)
+    brier_prior = brier_score_loss(y_prior_ALL_test, p_prior_bad_ALL)
+    ece_prior = compute_ece(p_prior_bad_ALL, y_prior_ALL_test)
+
 
     # ==================== 5. 运行 6 个 Baselines====================
     print("正在测试序列上运行 6 个 Baselines PK...")
@@ -284,7 +325,8 @@ def main(args):
             T_prior_current5 = compute_se3_prior(T_history5[-1],T_history5[-2])
             T_prior_current6 = compute_se3_prior(T_history6[-1],T_history6[-2])
    
-        p_help = p_help_dict[frame_id]
+        p_obs_bad = p_obs_bad_dict[frame_id]
+        p_prior_bad = p_prior_bad_dict[frame_id]
         support = support_dict[frame_id]
         # B1: Obs-Only 
         #b1_errs.append(e_obs)
@@ -338,14 +380,17 @@ def main(args):
             print("恢复帧数",frame_id)
             depth_raw = cv2.imread(depth_dict[frame_id],cv2.IMREAD_UNCHANGED)
             depth_real = depth_raw.astype(np.float32) / 1000.0
-            T_final = actual_recovery_action(depth_real, T_prior_current5, model_pts, K)
-            
+            #T_last_obs = T_history5 [blackout_start - 1]
+            T_final, T = actual_recovery_action(depth_real, model_pts, K)
+            if not T:
+                T_final=T_prior_current5
+            current_mode = "MODE_3_RECOVERY_EXECUTE"
             exited_blackout=False
 
         # =========================
         # 正常模式
         # =========================
-        elif p_help > args.p_help_threshold:
+        elif p_obs_bad <= p_prior_bad:
             # if 55<i:
             #  print(i)
             current_mode = "MODE_1_ACCEPT"
@@ -472,8 +517,9 @@ def main(args):
     # ==================== 6. 保存图像与 CSV 日志 ====================
     # 保存逐帧 CSV 日志
     df_log = pd.DataFrame({
-        "frame_idx": matched_frames,
-        "p_help": test_probs[:len(b5_errs)],
+        "frame_id": matched_frames,
+        "p_obs_bad": [p_obs_bad_dict[f]for f in matched_frames],
+        "p_prior_bad": [p_prior_bad_dict[f]for f in matched_frames],
         "selected_mode": b5_modes,
         "error_b1_obs_cm": b1_errs,
         "error_b2_obs_cm": b2_errs,
@@ -483,7 +529,7 @@ def main(args):
         "error_b6_obs_cm": b6_errs,
 
     })
-    df_log.to_csv(f"./checkpoint2_per_frame_{last_name}_log_phelp{args.p_help_threshold}_delta{args.delta}.csv", index=False)
+    df_log.to_csv(f"./checkpoint2_per_frame_{last_name}_log_threshold{args.risk_threshold}.csv", index=False)
 
     # 保存 Reliability Diagram
     plt.figure(figsize=(7, 6))
@@ -492,16 +538,33 @@ def main(args):
     bin_boundaries = np.linspace(0, 1, n_bins + 1)
     bin_accs, bin_confs = [], []
     for i in range(n_bins):
-        in_bin = (test_probs_ALL > bin_boundaries[i]) & (test_probs_ALL <= bin_boundaries[i+1])
+        in_bin = (p_obs_bad_ALL > bin_boundaries[i]) & (p_obs_bad_ALL <= bin_boundaries[i+1])
         if np.sum(in_bin) > 0:
-            bin_accs.append(np.mean(y_ALL_test[in_bin]))
-            bin_confs.append(np.mean(test_probs_ALL[in_bin]))
-    plt.plot(bin_confs, bin_accs, 's-', color='darkorange', linewidth=2, label=f'Ours (ECE={ece:.3f})')
-    plt.title(r'Reliability Diagram for Risk Predictor $P(\mathrm{Help})$', fontsize=11)
-    plt.xlabel(r'Predicted Risk Probability $P(\mathrm{Help})$', fontsize=11)
+            bin_accs.append(np.mean(y_obs_ALL_test[in_bin]))
+            bin_confs.append(np.mean(p_obs_bad_ALL[in_bin]))
+    plt.plot(bin_confs, bin_accs, 's-', color='darkorange', linewidth=2, label=f'Ours (ECE={ece_obs:.3f})')
+    plt.title(r'Reliability Diagram for Observation Risk', fontsize=11)
+    plt.xlabel(r'Predicted $P(\mathrm{Observation\ Bad})$', fontsize=11)
     plt.ylabel('Empirical Observed Help Frequency', fontsize=11)
     plt.legend(); plt.grid(True, linestyle='--')
-    plt.savefig(f'reliability_diagram_checkpoint2__phelp{args.p_help_threshold}_delta{args.delta}.png', dpi=300, bbox_inches='tight')
+    plt.savefig(f'reliability_diagram_observation_risk_threshold{args.risk_threshold}.png', dpi=300, bbox_inches='tight')
+
+    plt.figure(figsize=(7, 6))
+    plt.plot([0, 1], [0, 1], 'k--', label='Perfect Calibration (ECE=0)')
+    n_bins = 10
+    bin_boundaries = np.linspace(0, 1, n_bins + 1)
+    bin_accs, bin_confs = [], []
+    for i in range(n_bins):
+        in_bin = (p_prior_bad_ALL > bin_boundaries[i]) & (p_prior_bad_ALL <= bin_boundaries[i+1])
+        if np.sum(in_bin) > 0:
+            bin_accs.append(np.mean(y_prior_ALL_test[in_bin]))
+            bin_confs.append(np.mean(p_prior_bad_ALL[in_bin]))
+    plt.plot(bin_confs, bin_accs, 's-', color='darkorange', linewidth=2, label=f'Ours (ECE={ece_prior:.3f})')
+    plt.title(r'Reliability Diagram for Prior Risk', fontsize=11)
+    plt.xlabel(r'Predicted $P(\mathrm{Prior\ Bad})$', fontsize=11)
+    plt.ylabel('Empirical Observed Help Frequency', fontsize=11)
+    plt.legend(); plt.grid(True, linestyle='--')
+    plt.savefig(f'reliability_diagram_prior_risk_threshold{args.risk_threshold}.png', dpi=300, bbox_inches='tight')
 
     if "black" in args.result_dir: 
         # 保存 Trajectory Trace Plot
@@ -513,7 +576,7 @@ def main(args):
         plt.xlabel('Frame Number', fontsize=11)
         plt.ylabel('ADD-S Pose Error (cm)', fontsize=11)
         plt.legend(); plt.grid(True, linestyle='--')
-        plt.savefig(f'trajectory_recovery_plot_phelp{args.p_help_threshold}_delta{args.delta}.png', dpi=300, bbox_inches='tight')
+        plt.savefig(f'trajectory_recovery_plot_threshold{args.risk_threshold}.png', dpi=300, bbox_inches='tight')
 
     print("\n所有的 11 项交付物已全部生成完毕！图片与 CSV 已成功保存！")
 
@@ -522,15 +585,16 @@ def main(args):
     fail_rates = [np.mean(np.array(b1_errs) > 2.0)*100, np.mean(np.array(b2_errs) > 2.0)*100,np.mean(np.array(b3_errs) > 2.0)*100, np.mean(np.array(b4_errs) > 2.0)*100,np.mean(np.array(b5_errs) > 2.0)*100, np.mean(np.array(b6_errs) > 2.0)*100]
     latency_scores = [f"{avg_recovery_latency1} frames", f"{avg_recovery_latency2} frames", f"{avg_recovery_latency3} frames", f"{avg_recovery_latency4} frames", f"{avg_recovery_latency5} frames", f"{avg_recovery_latency6} frames"]
     false_triggers = ["N/A", "N/A", "N/A", "N/A", f"{false_recovery_triggers} times", "0 times"]
-    prob_metrics = {'auroc': auroc,'auprc': auprc,'brier': brier,'ece': ece,'temp_factor': temp_factor} 
+    prob_metrics_obs = {'auroc_obs': auroc_obs,'auprc_obs': auprc_obs,'brier_obs': brier_obs,'ece_obs': ece_obs,'temp_factor_obs': temp_factor_obs} 
+    prob_metrics_prior = {'auroc_prior': auroc_prior,'auprc_prior': auprc_prior,'brier_prior': brier_prior,'ece_prior': ece_prior,'temp_factor_prior': temp_factor_prior} 
     
 
-    return adds_scores, fail_rates, latency_scores, false_triggers, prob_metrics
+    return adds_scores, fail_rates, latency_scores, false_triggers, prob_metrics_obs, prob_metrics_prior
             
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--csv_path', type=str, default="./per_frame_help_dataset_delta0.0.csv", help="csv数据集路径")
+    parser.add_argument('--csv_path', type=str, default="./per_frame_help_dataset_threshold0.5.csv", help="csv数据集路径")
     parser.add_argument('--result_dir', nargs='+',type=str, default=["./results_collection/bleach_hard_00_03_chaitanya/bleach_hard_00_03_chaitanya_black10",
                                                                      "./results_collection/bleach_hard_00_03_chaitanya/bleach_hard_00_03_chaitanya_black10_2",
                                                                      "./results_collection/bleach_hard_00_03_chaitanya/bleach_hard_00_03_chaitanya_black10_3",
@@ -544,7 +608,7 @@ if __name__ == "__main__":
     parser.add_argument('--data_dir', type=str, default="./datasets/YCBInEOAT_Corrupted", help="受损数据集基础路径")
     parser.add_argument('--p_help_threshold', type=float, default=0.50, help="p_help_threshold")
     parser.add_argument('--alpha', type=float, default=0.5, help="B2-alpha")
-    parser.add_argument('--delta', type=float, default=0.0, help="delta")
+    parser.add_argument('--risk_threshold', type=float, default=0.5, help="risk_threshold")
     args = parser.parse_args()
     baseline_names = [
         "B1: Obs-Only se(3)-TrackNet",
@@ -559,7 +623,8 @@ if __name__ == "__main__":
     FAIL_dict = {}
     LATENCY_dict = {}
     TRIGGER_dict = {}
-    last_prob_metrics = None # 用于保存概率标定指标
+    last_prob_metrics_obs = None # 用于保存概率标定指标
+    last_prob_metrics_prior = None
 
     result_dirs = args.result_dir 
     
@@ -570,13 +635,14 @@ if __name__ == "__main__":
         print(f"\n正在评估 Episode: {basename} ...")
         
         # 接收 main(args) 返回的 5 个元组/列表！
-        adds_s, fails, lats, fts, prob_metrics = main(args) 
+        adds_s, fails, lats, fts, prob_metrics_obs, prob_metrics_prior = main(args) 
         
         ADDS_dict[basename] = adds_s
         FAIL_dict[basename] = fails
         LATENCY_dict[basename] = lats
         TRIGGER_dict[basename] = fts
-        last_prob_metrics = prob_metrics # 记录概率指标
+        last_prob_metrics_obs = prob_metrics_obs # 记录概率指标
+        last_prob_metrics_prior = prob_metrics_prior 
 
     print("\n" + "="*100)
     print("="*100)
@@ -610,25 +676,28 @@ if __name__ == "__main__":
         summary_rows.append(row_data)
 
     df_summary = pd.DataFrame(summary_rows)
-    #print(df_summary.to_string(index=False))
-    #print("="*100)
 
     # ====================  5 大概率标定指标！ ====================
-    if last_prob_metrics is not None:
+    if last_prob_metrics_obs is not None and last_prob_metrics_prior is not None:
         prob_df = pd.DataFrame([
-            {"Metric": "1. AUROC (Risk Discrimination)",       "Value": f"{last_prob_metrics['auroc']:.4f}"},
-            {"Metric": "2. AUPRC (Precision-Recall AUC)",     "Value": f"{last_prob_metrics['auprc']:.4f}"},
-            {"Metric": "3. Brier Score (Probability MSE)",    "Value": f"{last_prob_metrics['brier']:.4f}"},
-            {"Metric": "4. ECE (Expected Calibration Error)", "Value": f"{last_prob_metrics['ece']:.4f}"},
-            {"Metric": "5. Temp_Factor (Temperature Scalar)", "Value": f"{last_prob_metrics['temp_factor']:.4f}"}
+            {"Metric": "1. AUROC_obs (Risk Discrimination)",       "Value": f"{last_prob_metrics_obs['auroc_obs']:.4f}"},
+            {"Metric": "2. AUPRC_obs (Precision-Recall AUC)",     "Value": f"{last_prob_metrics_obs['auprc_obs']:.4f}"},
+            {"Metric": "3. Brier Score_obs (Probability MSE)",    "Value": f"{last_prob_metrics_obs['brier_obs']:.4f}"},
+            {"Metric": "4. ECE_obs (Expected Calibration Error)", "Value": f"{last_prob_metrics_obs['ece_obs']:.4f}"},
+            {"Metric": "5. Temp_Factor_obs (Temperature Scalar)", "Value": f"{last_prob_metrics_obs['temp_factor_obs']:.4f}"},
+            {"Metric": "1. AUROC_prior (Risk Discrimination)",       "Value": f"{last_prob_metrics_prior['auroc_prior']:.4f}"},
+            {"Metric": "2. AUPRC_prior (Precision-Recall AUC)",     "Value": f"{last_prob_metrics_prior['auprc_prior']:.4f}"},
+            {"Metric": "3. Brier Score_prior (Probability MSE)",    "Value": f"{last_prob_metrics_prior['brier_prior']:.4f}"},
+            {"Metric": "4. ECE_prior (Expected Calibration Error)", "Value": f"{last_prob_metrics_prior['ece_prior']:.4f}"},
+            {"Metric": "5. Temp_Factor_prior (Temperature Scalar)", "Value": f"{last_prob_metrics_prior['temp_factor_prior']:.4f}"}
         ])
 
-        prob_csv_path = f"./checkpoint2_probability_calibration_metrics_phelp{args.p_help_threshold}_delta{args.delta}.csv"
+        prob_csv_path = f"./checkpoint2_probability_calibration_metrics_threshold{args.risk_threshold}.csv"
         prob_df.to_csv(prob_csv_path, index=False)
         print(f"\n✅ 5 大概率标定指标已成功导出为 CSV: {prob_csv_path}")
 
     # 5. 导出为全指标大 CSV 文件
     basename2 = os.path.basename(result_dirs[0])
-    csv_out_path = f"./checkpoint2_full_metrics_episode_summary_{basename2}_phelp{args.p_help_threshold}_delta{args.delta}.csv"
+    csv_out_path = f"./checkpoint2_full_metrics_episode_summary_{basename2}_threshold{args.risk_threshold}.csv"
     df_summary.to_csv(csv_out_path, index=False)
     print(f"\n全指标 Episode 级汇总表格已保存为: {csv_out_path}")
