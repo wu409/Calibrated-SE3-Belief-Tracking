@@ -40,8 +40,6 @@ def se3_exp_map(delta):
     T[:3, 3] = t_vec
     return T
 
-
-
 def reliability_depth_residual(depth_real, pred_pose, scene, renderer,mesh_node):
     pose_render = cv_to_gl @ pred_pose
     scene.set_pose(mesh_node,pose_render)
@@ -96,7 +94,36 @@ def build_depth_dict(depth_dir, gt_dir):
         depth_dict[frame_id]=depth_file
 
     return depth_dict
+def build_safe_depth_dict(depth_folder, gt_dict):
+    """
+    将时间戳命名的 depth 文件安全映射到整数 frame_id (0, 1, 2...)
+    加入时间戳严格单调递增校验，彻底消灭错位风险！
+    """
+    # 1. 获取所有以时间戳命名的深度图文件
+    depth_files = glob.glob(os.path.join(depth_folder, "*.png"))
+    # 2. 从文件名提取纯数字时间戳，并按时间戳升序严格排序
+    def extract_timestamp(path):
+        digits = ''.join(filter(str.isdigit, os.path.basename(path)))
+        return int(digits) if len(digits) > 0 else 0
+        
+    depth_files_sorted = sorted(depth_files, key=extract_timestamp)
+    gt_frame_ids = sorted(gt_dict.keys()) # [0, 1, 2, ..., N]
 
+    # 3. 严格长度与非空断言 (防丢帧)
+    assert len(depth_files_sorted) == len(gt_frame_ids), \
+        f"错误: 深度图数量 ({len(depth_files_sorted)}) 与 GT 帧数 ({len(gt_frame_ids)}) 不一致！"
+
+    # 4. 校验时间戳是否严格单调递增 (防乱序)
+    timestamps = [extract_timestamp(f) for f in depth_files_sorted]
+    assert all(timestamps[k] < timestamps[k+1] for k in range(len(timestamps)-1)), \
+        "错误: 深度图时间戳非严格单调递增！存在乱序帧！"
+
+    # 5. 建立以整数 frame_id 为 Key 的安全字典
+    depth_dict = {}
+    for k, frame_id in enumerate(gt_frame_ids):
+        depth_dict[frame_id] = depth_files_sorted[k]
+
+    return depth_dict
 
 
 def main(args):
@@ -148,18 +175,16 @@ def main(args):
             pred_dict = build_frame_dict(f"{args.res_dir}/{seq_target}/{seq}")
             raw_seq_name = seq_target
             gt_dict = build_frame_dict(f"{args.ycb_dir}/{raw_seq_name}/annotated_poses")
-            matched_frames = sorted(set(pred_dict.keys()) & set(gt_dict.keys()))
-
-            depth_files = sorted(glob.glob(f"{args.data_dir}/{seq}/depth/*.png"))
-            frame_ids = sorted(gt_dict.keys())
+            print(f"{args.ycb_dir}/{raw_seq_name}/annotated_poses")
+            print(f"{args.data_dir}/{seq}/depth")
             depth_dict={}
+            depth_dict = build_safe_depth_dict(f"{args.data_dir}/{seq}/depth", gt_dict)
+            matched_frames = sorted(set(pred_dict.keys()) & set(gt_dict.keys()) & set(depth_dict.keys()))
+            print(f"成功安全对齐帧数: {len(matched_frames)} 帧！")
             
-            for frame_id, depth_path in zip(frame_ids, depth_files):
-                depth_dict[frame_id]=depth_path
-
             # print(f"{res_dir}/{seq_target}/{seq}/*.txt")
             history_frames = []
-            history_priors = {}
+            history_obs = {}
             for frame_id in matched_frames:
                 T_obs=np.loadtxt(pred_dict[frame_id])
                 T_gt=np.loadtxt(gt_dict[frame_id])
@@ -168,8 +193,8 @@ def main(args):
                     T_prior=T_obs     
                          
                 else:
-                    T_prev1= history_priors[history_frames[-1]]
-                    T_prev2= history_priors[history_frames[-2]]
+                    T_prev1= history_obs[history_frames[-1]]
+                    T_prev2= history_obs[history_frames[-2]]
                     delta1 = se3_log_map(np.linalg.inv(T_prev2) @ T_prev1)
                     T_prior = (T_prev1 @ se3_exp_map(delta1))
                 history_frames.append(frame_id)  
@@ -185,7 +210,7 @@ def main(args):
 
                 obs_risk_label = int(e_update_norm > risk_threshold_norml)
                 prior_risk_label = int(e_prior_norm > risk_threshold_norml)
-                history_priors[frame_id] = T_prior
+                history_obs[frame_id] = T_obs
                 
             
                 # E. 提取 4 个完全部署级的特征 (无 GT 依赖)
@@ -243,19 +268,17 @@ def main(args):
         pred_dict = build_frame_dict(f"{args.res_dir}/{args.ci_object}/{seq}")
         raw_seq_name = args.ci_object
         gt_dict = build_frame_dict(f"{args.ycb_dir}/{raw_seq_name}/annotated_poses")
-        matched_frames = sorted(set(pred_dict.keys()) & set(gt_dict.keys()))
-
-        depth_files = sorted(glob.glob(f"{args.data_dir}/{seq}/depth/*.png"))
-        frame_ids = sorted(gt_dict.keys())
+        print(f"{args.ycb_dir}/{raw_seq_name}/annotated_poses")
+        print(f"{args.data_dir}/{seq}/depth")
         depth_dict={}
-        
+        depth_dict = build_safe_depth_dict(f"{args.data_dir}/{seq}/depth", gt_dict)
+        matched_frames = sorted(set(pred_dict.keys()) & set(gt_dict.keys()) & set(depth_dict.keys()))
+        print(f"成功安全对齐帧数: {len(matched_frames)} 帧！")
 
-        for frame_id, depth_path in zip(frame_ids, depth_files):
-            depth_dict[frame_id]=depth_path
 
         # print(f"{res_dir}/{seq_target}/{seq}/*.txt")
         history_frames = []
-        history_priors = {}
+        history_obs = {}
         for frame_id in matched_frames:
             T_obs=np.loadtxt(pred_dict[frame_id])
             T_gt=np.loadtxt(gt_dict[frame_id])
@@ -264,11 +287,11 @@ def main(args):
                 T_prior=T_obs     
                         
             else:
-                T_prev1=history_priors[history_frames[-1]]
-                T_prev2=history_priors[history_frames[-2]]
+                T_prev1= history_obs[history_frames[-1]]
+                T_prev2= history_obs[history_frames[-2]]
                 delta1 = se3_log_map(np.linalg.inv(T_prev2) @ T_prev1)
                 T_prior = (T_prev1 @ se3_exp_map(delta1))
-            history_frames.append(frame_id)  
+            history_frames.append(frame_id) 
             # B. 计算两者的绝对 ADD-S 姿态误差 (cm)
             E_update_cm = U.adi(T_obs, T_gt, open3d_models[obj_idx]) * 100
             E_prior_cm = U.adi(T_prior, T_gt, open3d_models[obj_idx]) * 100
@@ -280,7 +303,7 @@ def main(args):
             
             obs_risk_label = int(e_update_norm > risk_threshold_norml)
             prior_risk_label = int(e_prior_norm > risk_threshold_norml)
-            history_priors[frame_id] = T_prior
+            history_obs[frame_id] = T_obs
             
             # E. 提取 4 个完全部署级的特征 (无 GT 依赖)
             depth_raw = cv2.imread(depth_dict[frame_id], cv2.IMREAD_UNCHANGED)
@@ -335,10 +358,21 @@ def main(args):
     df = pd.DataFrame(csv_rows)
     df.to_csv(f"./per_frame_label_threshold{args.risk_threshold}.csv", index=False)
 
+    balance_df = df.groupby('sequence').agg(
+        Total_Frames=('obs_risk_label', 'count'),
+        Obs_Risk_Positive_Ratio=('obs_risk_label', lambda x: f"{x.mean()*100:.2f}%"),
+        Prior_Risk_Positive_Ratio=('prior_risk_label', lambda x: f"{x.mean()*100:.2f}%")
+    ).reset_index()
+
+    balance_csv_path = f"./class_balance_summary_threshold{args.risk_threshold}.csv"
+    balance_df.to_csv(balance_csv_path, index=False)
+
+
     print("\n" + "="*50)
-    print("✅ 逐帧 CSV 标签数据集导出成功: ./per_frame_help_dataset.csv！")
     print(f"数据总行数: {len(df)} 行 | obs_risk=1 占比: {df['obs_risk_label'].mean()*100:.2f}%")
     print(f"数据总行数: {len(df)} 行 | prior_risk=1 占比: {df['prior_risk_label'].mean()*100:.2f}%")
+    print(f"✅ 逐帧日志已保存至: ./per_frame_label_threshold{args.risk_threshold}.csv")
+    print(f"✅ 类别平衡汇总表已保存至: {balance_csv_path}")
     print("="*50)
 
 

@@ -82,11 +82,10 @@ def get_frame_id(path):
     frame_id = os.path.splitext(filename)[0]
     return int(frame_id)
 
-def actual_recovery_action(current_depth_real, model_pts_3d, K):  
+def actual_recovery_action(current_depth_real, T_obs, model_pts_3d, K):  
 
-    valid_mask = ((current_depth_real > 0.2) &(current_depth_real < 2.0))
-
-    y_idx, x_idx = np.where(valid_mask) 
+    z_center = T_obs[2, 3]
+    y_idx, x_idx = np.where((current_depth_real > z_center - 0.2) & (current_depth_real < z_center + 0.2))
 
     if len(y_idx) < 100:
         print("recovery的输出为T_prior")
@@ -108,13 +107,43 @@ def actual_recovery_action(current_depth_real, model_pts_3d, K):
     # 以 T_prior 为初始猜测，但在 5cm 范围内自由寻找最佳吻合位置
     icp_result = o3d.pipelines.registration.registration_icp(
         pcd_obj, pcd_cam, max_correspondence_distance=0.05,
-        init=np.eye(4),
+        init=T_obs,
         estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPoint()
     )
     T = True
     print("recovery的输出为T_icp")
     return icp_result.transformation,T
 
+def build_safe_depth_dict(depth_folder, gt_dict):
+    """
+    将时间戳命名的 depth 文件安全映射到整数 frame_id (0, 1, 2...)
+    加入时间戳严格单调递增校验，彻底消灭错位风险！
+    """
+    # 1. 获取所有以时间戳命名的深度图文件
+    depth_files = glob.glob(os.path.join(depth_folder, "*.png"))
+    # 2. 从文件名提取纯数字时间戳，并按时间戳升序严格排序
+    def extract_timestamp(path):
+        digits = ''.join(filter(str.isdigit, os.path.basename(path)))
+        return int(digits) if len(digits) > 0 else 0
+        
+    depth_files_sorted = sorted(depth_files, key=extract_timestamp)
+    gt_frame_ids = sorted(gt_dict.keys()) # [0, 1, 2, ..., N]
+
+    # 3. 严格长度与非空断言 (防丢帧)
+    assert len(depth_files_sorted) == len(gt_frame_ids), \
+        f"错误: 深度图数量 ({len(depth_files_sorted)}) 与 GT 帧数 ({len(gt_frame_ids)}) 不一致！"
+
+    # 4. 校验时间戳是否严格单调递增 (防乱序)
+    timestamps = [extract_timestamp(f) for f in depth_files_sorted]
+    assert all(timestamps[k] < timestamps[k+1] for k in range(len(timestamps)-1)), \
+        "错误: 深度图时间戳非严格单调递增！存在乱序帧！"
+
+    # 5. 建立以整数 frame_id 为 Key 的安全字典
+    depth_dict = {}
+    for k, frame_id in enumerate(gt_frame_ids):
+        depth_dict[frame_id] = depth_files_sorted[k]
+
+    return depth_dict
 
 
 def main(args):
@@ -259,12 +288,9 @@ def main(args):
     pred_dict = {get_frame_id(f): f for f in pred_files}
     gt_dict = {get_frame_id(f): f for f in gt_files}
 
-    depth_files = sorted(glob.glob(f"{args.data_dir}/{last_name}/depth/*.png")) 
-    frame_ids = sorted(gt_dict.keys())
-    depth_dict={}
-    
-    for frame_id, depth_path in zip(frame_ids, depth_files):
-        depth_dict[frame_id]=depth_path
+    depth_dict = build_safe_depth_dict(f"{args.data_dir}/{last_name}/depth", gt_dict)
+    matched_frames = sorted(set(pred_dict.keys()) & set(gt_dict.keys()) & set(depth_dict.keys()))
+    print(f"成功安全对齐帧数: {len(matched_frames)} 帧！")
 
     # 显式求交集
     matched_frames = sorted(set(pred_dict.keys()) & set(gt_dict.keys()))
@@ -380,8 +406,7 @@ def main(args):
             print("恢复帧数",frame_id)
             depth_raw = cv2.imread(depth_dict[frame_id],cv2.IMREAD_UNCHANGED)
             depth_real = depth_raw.astype(np.float32) / 1000.0
-            #T_last_obs = T_history5 [blackout_start - 1]
-            T_final, T = actual_recovery_action(depth_real, model_pts, K)
+            T_final, T = actual_recovery_action(depth_real,T_candidates[i], model_pts, K)
             if not T:
                 T_final=T_prior_current5
             current_mode = "MODE_3_RECOVERY_EXECUTE"
@@ -390,7 +415,7 @@ def main(args):
         # =========================
         # 正常模式
         # =========================
-        elif p_obs_bad <= p_prior_bad:
+        elif p_obs_bad <= 0.7:
             # if 55<i:
             #  print(i)
             current_mode = "MODE_1_ACCEPT"
@@ -518,8 +543,8 @@ def main(args):
     # 保存逐帧 CSV 日志
     df_log = pd.DataFrame({
         "frame_id": matched_frames,
-        "p_obs_bad": [p_obs_bad_dict[f]for f in matched_frames],
-        "p_prior_bad": [p_prior_bad_dict[f]for f in matched_frames],
+        "p_obs_bad": [p_obs_bad_dict[f] for f in matched_frames],
+        "p_prior_bad": [p_prior_bad_dict[f] for f in matched_frames],
         "selected_mode": b5_modes,
         "error_b1_obs_cm": b1_errs,
         "error_b2_obs_cm": b2_errs,
@@ -594,7 +619,7 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--csv_path', type=str, default="./per_frame_help_dataset_threshold0.5.csv", help="csv数据集路径")
+    parser.add_argument('--csv_path', type=str, default="./per_frame_label_threshold0.5.csv", help="csv数据集路径")
     parser.add_argument('--result_dir', nargs='+',type=str, default=["./results_collection/bleach_hard_00_03_chaitanya/bleach_hard_00_03_chaitanya_black10",
                                                                      "./results_collection/bleach_hard_00_03_chaitanya/bleach_hard_00_03_chaitanya_black10_2",
                                                                      "./results_collection/bleach_hard_00_03_chaitanya/bleach_hard_00_03_chaitanya_black10_3",

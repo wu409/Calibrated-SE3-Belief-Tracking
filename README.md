@@ -33,7 +33,7 @@ python 1-risk_label.py ^
 Step5: Train and evaluation
 '''
 python 2-train_evaluation.py ^
---csv_path ./per_frame_help_dataset_threshold0.5.csv ^
+--csv_path ./per_frame_label_threshold0.5.csv ^
 --result_dir "./results_collection/bleach_hard_00_03_chaitanya/bleach_hard_00_03_chaitanya_black10" "./results_collection/bleach_hard_00_03_chaitanya/bleach_hard_00_03_chaitanya_black10_2" "./results_collection/bleach_hard_00_03_chaitanya/bleach_hard_00_03_chaitanya_black10_3" "./results_collection/bleach_hard_00_03_chaitanya/bleach_hard_00_03_chaitanya_black10_4" "./results_collection/bleach_hard_00_03_chaitanya/bleach_hard_00_03_chaitanya_black10_5" ^
 --gt_dir ./datasets/YCBInEOAT/bleach_hard_00_03_chaitanya/annotated_poses ^
 --point_path ./datasets/YCB_Video_Models/CADmodels/021_bleach_cleanser/points.xyz ^
@@ -45,7 +45,10 @@ python 2-train_evaluation.py ^
 --risk_threshold 0.5
 '''
 
-
+Addition：missing/reordered-frame unit tests
+'''
+python 3-frame_unit_tests .py
+'''
 
 
 
