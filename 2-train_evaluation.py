@@ -415,7 +415,7 @@ def main(args):
         # =========================
         # 正常模式
         # =========================
-        elif p_obs_bad <= 0.7:
+        elif p_obs_bad <= 0.8:
             # if 55<i:
             #  print(i)
             current_mode = "MODE_1_ACCEPT"
