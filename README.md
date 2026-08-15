@@ -45,10 +45,6 @@ python 2-train_evaluation.py ^
 --risk_threshold 0.5
 '''
 
-Addition：missing/reordered-frame unit tests
-'''
-python 3-frame_unit_tests .py
-'''
 
 
 

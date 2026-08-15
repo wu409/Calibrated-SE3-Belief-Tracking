@@ -15,6 +15,10 @@ from collections import Counter
 from sklearn.metrics import roc_auc_score, precision_recall_curve, auc, brier_score_loss
 import argparse
 from scipy.stats import t
+import re
+import hashlib
+import pandas as pd
+
 
 K = np.array([
     [3.195820007324218750e+02,    0.0,   3.202149847676955687e+02],
@@ -76,74 +80,124 @@ def compute_episode_level_ci(scores, n_bootstraps=2000, confidence_level=0.95):
 
     return mean_score, lower_bound, upper_bound
 
-def get_frame_id(path):
 
-    filename = os.path.basename(path)
-    frame_id = os.path.splitext(filename)[0]
-    return int(frame_id)
+def actual_recovery_action(current_depth_real, model_pts_3d, K):  
+   
+    y_idx, x_idx = np.where((current_depth_real > 0.5) & (current_depth_real < 1.2))
 
-def actual_recovery_action(current_depth_real, T_obs, model_pts_3d, K):  
+    if len(y_idx) < 300:
+        print("[Recovery] 有效深度点过少，恢复失败！")
+        return None, False
 
-    z_center = T_obs[2, 3]
-    y_idx, x_idx = np.where((current_depth_real > z_center - 0.2) & (current_depth_real < z_center + 0.2))
+    z = current_depth_real[y_idx, x_idx]
+    x = (x_idx - K[0, 2]) * z / K[0, 0]
+    y = (y_idx - K[1, 2]) * z / K[1, 1]
 
-    if len(y_idx) < 100:
-        print("recovery的输出为T_prior")
-        T = False
-        return False # 依然全黑，无法恢复，继续听先验
+    scene_pts = np.vstack([x, y, z]).T
+    pcd_scene = o3d.geometry.PointCloud()
+    pcd_scene.points = o3d.utility.Vector3dVector(scene_pts)
+
+  
+    plane_model, inliers = pcd_scene.segment_plane(distance_threshold=0.015, ransac_n=3, num_iterations=500)
     
-    z_vals = current_depth_real[y_idx, x_idx]
-    x_c = (x_idx - K[0, 2]) * z_vals / K[0, 0]
-    y_c = (y_idx - K[1, 2]) * z_vals / K[1, 1]
-    camera_pts = np.vstack((x_c, y_c, z_vals)).T
     
-    pcd_cam = o3d.geometry.PointCloud()
-    pcd_cam.points = o3d.utility.Vector3dVector(camera_pts)
-    
-    # 2. 准备物体的 CAD 点云
-    pcd_obj = o3d.geometry.PointCloud()
-    pcd_obj.points = o3d.utility.Vector3dVector(model_pts_3d)
-    
-    # 以 T_prior 为初始猜测，但在 5cm 范围内自由寻找最佳吻合位置
+    pcd_objects = pcd_scene.select_by_index(inliers, invert=True)
+
+    if len(pcd_objects.points) < 50:
+        pcd_objects = pcd_scene # 兜底
+
+    obj_pts = np.asarray(pcd_objects.points)
+    real_bottle_center = np.median(obj_pts, axis=0) # 真实的瓶子 3D 坐标！
+
+    # 构建粗姿态 T_coarse
+    model_center = np.mean(model_pts_3d, axis=0)
+    T_coarse = np.eye(4)
+    T_coarse[:3, 3] = (real_bottle_center - model_center)
+
+    pcd_model = o3d.geometry.PointCloud()
+    pcd_model.points = o3d.utility.Vector3dVector(model_pts_3d)
+
     icp_result = o3d.pipelines.registration.registration_icp(
-        pcd_obj, pcd_cam, max_correspondence_distance=0.05,
-        init=T_obs,
+        pcd_model,
+        pcd_objects,
+        max_correspondence_distance=0.10, # 10cm 抓取半径
+        init=T_coarse,
         estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPoint()
     )
-    T = True
-    print("recovery的输出为T_icp")
-    return icp_result.transformation,T
 
-def build_safe_depth_dict(depth_folder, gt_dict):
-    """
-    将时间戳命名的 depth 文件安全映射到整数 frame_id (0, 1, 2...)
-    加入时间戳严格单调递增校验，彻底消灭错位风险！
-    """
-    # 1. 获取所有以时间戳命名的深度图文件
-    depth_files = glob.glob(os.path.join(depth_folder, "*.png"))
-    # 2. 从文件名提取纯数字时间戳，并按时间戳升序严格排序
-    def extract_timestamp(path):
-        digits = ''.join(filter(str.isdigit, os.path.basename(path)))
-        return int(digits) if len(digits) > 0 else 0
-        
-    depth_files_sorted = sorted(depth_files, key=extract_timestamp)
-    gt_frame_ids = sorted(gt_dict.keys()) # [0, 1, 2, ..., N]
+    if icp_result.fitness < 0.15:
+        print("ICP recovery failed")
+        return None, False
 
-    # 3. 严格长度与非空断言 (防丢帧)
-    assert len(depth_files_sorted) == len(gt_frame_ids), \
-        f"错误: 深度图数量 ({len(depth_files_sorted)}) 与 GT 帧数 ({len(gt_frame_ids)}) 不一致！"
+    print(" ICP 恢复成功! Fitness:", icp_result.fitness)
+    return icp_result.transformation, True
 
-    # 4. 校验时间戳是否严格单调递增 (防乱序)
-    timestamps = [extract_timestamp(f) for f in depth_files_sorted]
-    assert all(timestamps[k] < timestamps[k+1] for k in range(len(timestamps)-1)), \
-        "错误: 深度图时间戳非严格单调递增！存在乱序帧！"
+def get_exact_file_number(filepath):
+    """只从文件名 (不看文件夹路径) 中提取最末尾的纯数字 ID"""
+    filename = os.path.basename(filepath) # 
+    digits = re.findall(r'\d+', filename)
+    return int(digits[-1]) if len(digits) > 0 else -1
 
-    # 5. 建立以整数 frame_id 为 Key 的安全字典
-    depth_dict = {}
-    for k, frame_id in enumerate(gt_frame_ids):
-        depth_dict[frame_id] = depth_files_sorted[k]
+def extract_timestamp_int(filepath):
+    filename = os.path.basename(filepath)
+    digits = ''.join(filter(str.isdigit, filename))
+    return int(digits) if len(digits) > 0 else 0
 
-    return depth_dict
+def get_file_sha256(filepath):
+    """计算文件的哈希值，证明文件完整未被篡改"""
+    hasher = hashlib.sha256()
+    with open(filepath, 'rb') as f:
+        hasher.update(f.read(1024)) 
+    return hasher.hexdigest()[:10]
+
+def build_and_verify_manifest(dataset_dir, seq_name, res_dir, gt_dir, out_manifest_csv="./manifest.csv"):
+
+    rgb_dir = os.path.join(dataset_dir, seq_name, "rgb")
+    depth_dir = os.path.join(dataset_dir, seq_name, "depth")
+    pred_dir = res_dir
+
+    rgb_files = sorted(glob.glob(os.path.join(rgb_dir, "*.png")))
+    depth_files = sorted(glob.glob(os.path.join(depth_dir, "*.png")))
+    gt_files = sorted(glob.glob(os.path.join(gt_dir, "*.txt")))
+    pred_files = sorted(glob.glob(os.path.join(pred_dir, "*.txt")))
+    # print(pred_dir)
+    # print(pred_files)
+
+    n_frames = len(gt_files)
+    assert len(rgb_files) == n_frames, f"RGB 数量 ({len(rgb_files)}) 与 GT ({n_frames}) 不一致！"
+    assert len(depth_files) == n_frames, f"Depth 数量 ({len(depth_files)}) 与 GT ({n_frames}) 不一致！"
+    assert len(pred_files) == n_frames, f"Pred 数量 ({len(pred_files)}) 与 GT ({n_frames}) 不一致！"
+
+    manifest_rows = []
+    
+    for k in range(n_frames):
+        rgb_p   = rgb_files[k]
+        depth_p = depth_files[k]
+        gt_p    = gt_files[k]
+        pred_p  = pred_files[k] # 每一帧都是正确的 pred_files[k]！
+
+        rgb_ts = os.path.basename(rgb_p)
+        depth_ts = os.path.basename(depth_p)
+        assert rgb_ts == depth_ts, f"第 {k} 帧 RGB 与 Depth 时间戳不一致 ({rgb_ts} != {depth_ts})！"
+
+        real_fid = get_exact_file_number(gt_p) # 从当前第 k 个 GT 文件提取真实帧号
+
+        manifest_rows.append({
+            "seq_idx": k,               # 循环顺序: 0, 1, 2, ..., 440
+            "frame_idx": real_fid,      # 真实物理帧号: 0, 1, 5, ..., 525
+            "timestamp": rgb_ts,
+            "rgb_path": rgb_p,
+            "depth_path": depth_p,
+            "gt_path": gt_p,
+            "pred_path": pred_p         # 完美逐帧递增！
+        })
+
+    # 导出权威 Manifest CSV
+    df_manifest = pd.DataFrame(manifest_rows)
+    df_manifest.to_csv(out_manifest_csv, index=False)
+    print(f"已生成并验证通过: {out_manifest_csv} (共 {n_frames} 帧)")
+    
+    return df_manifest
 
 
 def main(args):
@@ -156,6 +210,8 @@ def main(args):
     train_df = df[df['sequence'].str.contains(train_pattern)]
 
     matched_train_seqs = df[df['sequence'].str.contains(train_pattern)]['sequence'].unique()  
+
+
     #对匹配到的每一个训练序列，按时间轴切成前 80% (训练) 和 后 20% (校准)
     train_dfs, cal_dfs = [], []
     for seq in matched_train_seqs:
@@ -272,66 +328,27 @@ def main(args):
 
     # ==================== 5. 运行 6 个 Baselines====================
     print("正在测试序列上运行 6 个 Baselines PK...")
+
+    
     point_path = args.point_path
     with open(point_path, 'r') as f:
         model_pts = np.array([list(map(float, line.rstrip().split())) for line in f.readlines()])
     open3d_model = U.toOpen3dCloud(model_pts, colors=np.zeros(model_pts.shape, dtype=np.float64))
 
 
-    result_dir=args.result_dir
-    gt_dir=args.gt_dir
+
     last_name = os.path.basename(args.result_dir)
-
-    pred_files=glob.glob(os.path.join(result_dir,"*.txt"))
-    gt_files=glob.glob(os.path.join(gt_dir,"*.txt"))
-
-    pred_dict = {get_frame_id(f): f for f in pred_files}
-    gt_dict = {get_frame_id(f): f for f in gt_files}
-
-    depth_dict = build_safe_depth_dict(f"{args.data_dir}/{last_name}/depth", gt_dict)
-    matched_frames = sorted(set(pred_dict.keys()) & set(gt_dict.keys()) & set(depth_dict.keys()))
-    print(f"成功安全对齐帧数: {len(matched_frames)} 帧！")
-
-    # 显式求交集
-    matched_frames = sorted(set(pred_dict.keys()) & set(gt_dict.keys()))
-    missing_pred = sorted(set(gt_dict.keys()) - set(pred_dict.keys()))
-    missing_gt = sorted(set(pred_dict.keys()) - set(gt_dict.keys()))
-
-    print("="*50)
-    print(f"GT frames        : {len(gt_dict)}")
-    print(f"Prediction frames: {len(pred_dict)}")
-    print(f"Matched frames   : {len(matched_frames)}")
-    print(f"Missing prediction frames:")
-    print(missing_pred[:20])
-    print(f"Missing GT frames:")
-    print(missing_gt[:20])
-    print("="*50)
-
-
-    T_candidates=[]
-    T_gts=[]
-    frame_ids=[]
-
-
-    for frame_id in matched_frames:
-        pred_path = pred_dict[frame_id]
-        gt_path   = gt_dict[frame_id]
-        T_pred = np.loadtxt(pred_path).reshape(4,4)
-        T_gt   = np.loadtxt(gt_path).reshape(4,4)
-        T_candidates.append(T_pred)
-        T_gts.append(T_gt)
-        frame_ids.append(frame_id)
-  
-
-    T_candidates=np.array(T_candidates)
-    T_gts=np.array(T_gts)
-    frame_ids=np.array(frame_ids)
-
+    df_manifest = build_and_verify_manifest(
+        dataset_dir=args.data_dir,
+        seq_name=last_name,
+        res_dir=args.result_dir,
+        gt_dir=args.gt_dir,
+        out_manifest_csv=f"./manifest_{last_name}.csv")
 
     # 定义 6 个 Baselines 最终的逐帧姿态误差结果 (cm)
     b1_errs,  b2_errs,  b3_errs,  b4_errs,  b5_errs,  b6_errs  = [], [], [], [], [], []
     b5_modes = [] # 记录三模式历史
-
+    matched_frames=[]
     consecutive_blackout = 0
     false_recovery_triggers = 0
     recovery_latencies1,recovery_latencies2,recovery_latencies3,recovery_latencies4,recovery_latencies5,recovery_latencies6 = [],[],[],[],[],[] # 记录恢复延迟
@@ -340,40 +357,53 @@ def main(args):
     blackout_end = 1e10
 
 
-    for i, frame_id in enumerate(matched_frames):
+    #for i, frame_id in enumerate(matched_frames):
+    for row in df_manifest.itertuples():
+    # 直接从权威 Manifest 行中提取数据，绝对不可能错位！
+        i = row.seq_idx
+        frame_id = row.frame_idx
+        matched_frames.append(frame_id)
+        depth_file = row.depth_path
+        gt_file    = row.gt_path
+        pred_file  = row.pred_path
 
+        # 读取姿态与深度图
+        T_obs = np.loadtxt(pred_file).reshape(4, 4)
+        T_gt  = np.loadtxt(gt_file).reshape(4, 4)
+        depth_raw = cv2.imread(depth_file, cv2.IMREAD_UNCHANGED)
+        
         if i < 2: 
-            T_prior_current2,T_prior_current3,T_prior_current4,T_prior_current5,T_prior_current6 = T_candidates[i],T_candidates[i],T_candidates[i],T_candidates[i],T_candidates[i]  # 初始化阶段
+            T_prior_current2,T_prior_current3,T_prior_current4,T_prior_current5,T_prior_current6 = T_obs,T_obs,T_obs,T_obs,T_obs  # 初始化阶段
         else:
             T_prior_current2 = compute_se3_prior(T_history2[-1],T_history2[-2])
             T_prior_current3 = compute_se3_prior(T_history3[-1],T_history3[-2])
             T_prior_current4 = compute_se3_prior(T_history4[-1],T_history4[-2])
             T_prior_current5 = compute_se3_prior(T_history5[-1],T_history5[-2])
             T_prior_current6 = compute_se3_prior(T_history6[-1],T_history6[-2])
-   
+
         p_obs_bad = p_obs_bad_dict[frame_id]
         p_prior_bad = p_prior_bad_dict[frame_id]
         support = support_dict[frame_id]
         # B1: Obs-Only 
         #b1_errs.append(e_obs)
-        b1_errs.append(U.adi(T_candidates[i],T_gts[i],open3d_model)* 100)
+        b1_errs.append(U.adi(T_obs,T_gt,open3d_model)* 100)
         
         # B2: Fixed-alpha Smoothing (0.5)
-        delta=se3_log_map(np.linalg.inv(T_prior_current2)@T_candidates[i])
+        delta=se3_log_map(np.linalg.inv(T_prior_current2)@T_obs)
         T_final2=T_prior_current2 @ se3_exp_map(args.alpha*delta)
-        b2_errs.append(U.adi(T_final2,T_gts[i],open3d_model)* 100)
+        b2_errs.append(U.adi(T_final2,T_gt,open3d_model)* 100)
         T_history2.append(T_final2)
 
         # B3: Hard Depth Threshold (深度缺失则听惯性)
         if support<0.4:
-            T_final3 = T_candidates[i]
+            T_final3 = T_obs
         else:
             T_final3 = T_prior_current3
         T_history3.append(T_final3)
-        b3_errs.append(U.adi(T_final3,T_gts[i],open3d_model)* 100)
+        b3_errs.append(U.adi(T_final3,T_gt,open3d_model)* 100)
 
         # B4: Robust Huber Weighting
-        innovation=se3_log_map(np.linalg.inv(T_prior_current4)@T_candidates[i])
+        innovation=se3_log_map(np.linalg.inv(T_prior_current4)@T_obs)
         r=np.linalg.norm(innovation)
         delta=0.1
         if r<=delta:
@@ -382,7 +412,7 @@ def main(args):
             alpha=delta/r
         T_huber=T_prior_current4@se3_exp_map(alpha*innovation)
         T_history4.append(T_huber)
-        b4_errs.append(U.adi(T_huber,T_gts[i],open3d_model)* 100)
+        b4_errs.append(U.adi(T_huber,T_gt,open3d_model)* 100)
 
         #  B5: Proposed Three-Mode Policy
         if support == 1:
@@ -404,9 +434,9 @@ def main(args):
 
         elif 'exited_blackout' in locals() and exited_blackout:
             print("恢复帧数",frame_id)
-            depth_raw = cv2.imread(depth_dict[frame_id],cv2.IMREAD_UNCHANGED)
+
             depth_real = depth_raw.astype(np.float32) / 1000.0
-            T_final, T = actual_recovery_action(depth_real,T_candidates[i], model_pts, K)
+            T_final, T = actual_recovery_action(depth_real, model_pts, K)
             if not T:
                 T_final=T_prior_current5
             current_mode = "MODE_3_RECOVERY_EXECUTE"
@@ -419,31 +449,34 @@ def main(args):
             # if 55<i:
             #  print(i)
             current_mode = "MODE_1_ACCEPT"
-            T_final = T_candidates[i]
-        else:
+            T_final = T_obs
+        elif p_prior_bad <= 0.8:
             current_mode = "MODE_2_PRIOR"
             T_final = T_prior_current5 
-
+        else:
+        
+            current_mode="MODE_3_UNCERTAIN_FUSION"
+            T_delta = np.linalg.inv(T_prior_current5) @ T_obs
+            alpha = 0.5
+            T_final = T_prior_current5 @ se3_exp_map(alpha * se3_log_map(T_delta))
+                    
         T_history5.append(T_final)
-        b5_errs.append(U.adi(T_final, T_gts[i], open3d_model) * 100)
+        b5_errs.append(U.adi(T_final, T_gt, open3d_model) * 100)
         b5_modes.append(current_mode)
 
         if (i < blackout_start or i>blackout_end) and current_mode == "MODE_3_BLACKOUT_WAITING" :
-                print(blackout_start)
-                print(blackout_end)
-                print(i)
                 false_recovery_triggers += 1
 
 
         # B6: Oracle Decision Policy
-        err_obs = U.adi(T_candidates[i], T_gts[i],open3d_model)
-        err_prior = U.adi(T_prior_current6,T_gts[i],open3d_model)
+        err_obs = U.adi(T_obs, T_gt,open3d_model)
+        err_prior = U.adi(T_prior_current6,T_gt,open3d_model)
         if err_obs < err_prior:
-            T_final_oracle = T_candidates[i]
+            T_final_oracle = T_obs
         else:
             T_final_oracle = T_prior_current6
         T_history6.append(T_final_oracle)
-        b6_errs.append(U.adi(T_final_oracle,T_gts[i],open3d_model)*100)
+        b6_errs.append(U.adi(T_final_oracle,T_gt,open3d_model)*100)
 
         # T_final2=T_prior_current2
         # T_history2.append(T_final2)

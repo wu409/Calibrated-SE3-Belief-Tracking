@@ -8,6 +8,7 @@ from scipy.spatial.transform import Rotation as R_sci
 import trimesh
 import pyrender
 import argparse
+import open3d  as o3d
 
 K = np.array([
     [3.195820007324218750e+02,    0.0,   3.202149847676955687e+02],
@@ -125,6 +126,45 @@ def build_safe_depth_dict(depth_folder, gt_dict):
 
     return depth_dict
 
+def actual_recovery_action(current_depth_real, T_obs, model_pts_3d, K):  
+
+    model_h=np.hstack([model_pts_3d,np.ones((len(model_pts_3d),1))])
+    model_cam=(T_obs @ model_h.T).T[:,:3]
+    z_min=model_cam[:,2].min()
+    z_max=model_cam[:,2].max()
+    
+    margin=0.05
+    mask=((current_depth_real>z_min-margin)&(current_depth_real<z_max+margin))
+    y_idx,x_idx=np.where(mask)
+
+    if len(y_idx) < 100:
+        print("recovery的输出为T_prior")
+        T = False
+        return 0, False # 依然全黑，无法恢复，继续听先验
+    
+    z_vals = current_depth_real[y_idx, x_idx]
+    x_c = (x_idx - K[0, 2]) * z_vals / K[0, 0]
+    y_c = (y_idx - K[1, 2]) * z_vals / K[1, 1]
+    camera_pts = np.vstack((x_c, y_c, z_vals)).T
+    
+    pcd_cam = o3d.geometry.PointCloud()
+    pcd_cam.points = o3d.utility.Vector3dVector(camera_pts)
+    
+    # 2. 准备物体的 CAD 点云
+    pcd_obj = o3d.geometry.PointCloud()
+    pcd_obj.points = o3d.utility.Vector3dVector(model_pts_3d)
+    
+    # 以 T_prior 为初始猜测，但在 5cm 范围内自由寻找最佳吻合位置
+    icp_result = o3d.pipelines.registration.registration_icp(
+        pcd_obj, pcd_cam, max_correspondence_distance=0.05,
+        init=T_obs,
+        estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPoint()
+    )
+    T = True
+    print("recovery的输出为T_icp")
+    return icp_result.transformation,T
+
+
 
 def main(args):
     csv_rows = []
@@ -184,7 +224,10 @@ def main(args):
             
             # print(f"{res_dir}/{seq_target}/{seq}/*.txt")
             history_frames = []
-            history_obs = {}
+            history_final = {}
+
+
+
             for frame_id in matched_frames:
                 T_obs=np.loadtxt(pred_dict[frame_id])
                 T_gt=np.loadtxt(gt_dict[frame_id])
@@ -193,8 +236,8 @@ def main(args):
                     T_prior=T_obs     
                          
                 else:
-                    T_prev1= history_obs[history_frames[-1]]
-                    T_prev2= history_obs[history_frames[-2]]
+                    T_prev1= history_final[history_frames[-1]]
+                    T_prev2= history_final[history_frames[-2]]
                     delta1 = se3_log_map(np.linalg.inv(T_prev2) @ T_prev1)
                     T_prior = (T_prev1 @ se3_exp_map(delta1))
                 history_frames.append(frame_id)  
@@ -210,12 +253,20 @@ def main(args):
 
                 obs_risk_label = int(e_update_norm > risk_threshold_norml)
                 prior_risk_label = int(e_prior_norm > risk_threshold_norml)
-                history_obs[frame_id] = T_obs
-                
-            
-                # E. 提取 4 个完全部署级的特征 (无 GT 依赖)
+
                 depth_raw = cv2.imread(depth_dict[frame_id], cv2.IMREAD_UNCHANGED)
                 depth_real = depth_raw.astype(np.float32) / 1000.0
+                if obs_risk_label == 0:
+                    history_final[frame_id] = T_obs
+                elif prior_risk_label == 0:
+                    history_final[frame_id] = T_prior
+                else:
+                    T_delta = np.linalg.inv(T_prior) @ T_obs
+                    alpha = 0.5
+                    T_final = T_prior @ se3_exp_map(alpha * se3_log_map(T_delta))    
+                    history_final[frame_id] = T_final
+            
+                # E. 提取 4 个完全部署级的特征 (无 GT 依赖)
                 
                 x1_depth_residual = reliability_depth_residual(depth_real, T_obs, scenes[obj_idx],renders_obj[obj_idx],mesh_nodes[obj_idx])
 
@@ -278,7 +329,7 @@ def main(args):
 
         # print(f"{res_dir}/{seq_target}/{seq}/*.txt")
         history_frames = []
-        history_obs = {}
+        history_final = {}
         for frame_id in matched_frames:
             T_obs=np.loadtxt(pred_dict[frame_id])
             T_gt=np.loadtxt(gt_dict[frame_id])
@@ -287,8 +338,8 @@ def main(args):
                 T_prior=T_obs     
                         
             else:
-                T_prev1= history_obs[history_frames[-1]]
-                T_prev2= history_obs[history_frames[-2]]
+                T_prev1= history_final[history_frames[-1]]
+                T_prev2= history_final[history_frames[-2]]
                 delta1 = se3_log_map(np.linalg.inv(T_prev2) @ T_prev1)
                 T_prior = (T_prev1 @ se3_exp_map(delta1))
             history_frames.append(frame_id) 
@@ -303,12 +354,18 @@ def main(args):
             
             obs_risk_label = int(e_update_norm > risk_threshold_norml)
             prior_risk_label = int(e_prior_norm > risk_threshold_norml)
-            history_obs[frame_id] = T_obs
-            
-            # E. 提取 4 个完全部署级的特征 (无 GT 依赖)
             depth_raw = cv2.imread(depth_dict[frame_id], cv2.IMREAD_UNCHANGED)
             depth_real = depth_raw.astype(np.float32) / 1000.0
-            
+            if obs_risk_label == 0:
+                history_final[frame_id] = T_obs
+            elif prior_risk_label == 0:
+                history_final[frame_id] = T_prior
+            else:
+                T_delta = np.linalg.inv(T_prior) @ T_obs
+                alpha = 0.5
+                T_final = T_prior @ se3_exp_map(alpha * se3_log_map(T_delta))       
+                history_final[frame_id] = T_final
+
             x1_depth_residual = reliability_depth_residual(depth_real, T_obs, scenes[obj_idx],renders_obj[obj_idx],mesh_nodes[obj_idx])
 
             R_p, t_p = T_obs[:3, :3], T_obs[:3, 3]
