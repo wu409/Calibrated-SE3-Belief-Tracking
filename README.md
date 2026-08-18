@@ -45,6 +45,14 @@ python 2-train_evaluation.py ^
 --risk_threshold 0.5
 '''
 
-
+Addition:
+frame unit test：
+'''
+python python 3-frame_unit_tests.py ^
+--dataset_dir ./datasets\YCBInEOAT_Corrupted2 ^
+--seq_name bleach_hard_00_03_chaitanya_black10_2 ^
+--gt_dir .\datasets\YCBInEOAT\bleach_hard_00_03_chaitanya\annotated_poses ^
+--pred_dir .\results_collection\bleach_hard_00_03_chaitanya\bleach_hard_00_03_chaitanya_black10_2
+'''
 
 

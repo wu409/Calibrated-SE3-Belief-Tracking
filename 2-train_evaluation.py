@@ -132,70 +132,90 @@ def actual_recovery_action(current_depth_real, model_pts_3d, K):
     print(" ICP 恢复成功! Fitness:", icp_result.fitness)
     return icp_result.transformation, True
 
+def compute_full_sha256(filepath):
+    """计算文件的完整 64 位 SHA-256 哈希值 (读全量数据，绝不截断)"""
+    hasher = hashlib.sha256()
+    with open(filepath, 'rb') as f:
+        while chunk := f.read(65536):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
 def get_exact_file_number(filepath):
-    """只从文件名 (不看文件夹路径) 中提取最末尾的纯数字 ID"""
-    filename = os.path.basename(filepath) # 
+    """只从文件名提取纯数字 ID (如 000150.txt -> 150)"""
+    filename = os.path.basename(filepath)
     digits = re.findall(r'\d+', filename)
     return int(digits[-1]) if len(digits) > 0 else -1
 
 def extract_timestamp_int(filepath):
+    """从时间戳文件名提取纯数字时间戳"""
     filename = os.path.basename(filepath)
     digits = ''.join(filter(str.isdigit, filename))
     return int(digits) if len(digits) > 0 else 0
 
-def get_file_sha256(filepath):
-    """计算文件的哈希值，证明文件完整未被篡改"""
-    hasher = hashlib.sha256()
-    with open(filepath, 'rb') as f:
-        hasher.update(f.read(1024)) 
-    return hasher.hexdigest()[:10]
-
-def build_and_verify_manifest(dataset_dir, seq_name, res_dir, gt_dir, out_manifest_csv="./manifest.csv"):
-
+def build_and_verify_manifest(dataset_dir, seq_name, res_dir, gt_dir, out_manifest_csv="./manifest.csv", max_async_tolerance_ms=50):
+    """
+    权威的 4 模态 (RGB, Depth, GT, Pred) 严格对齐、异步时间戳关联与完整 Hash 校验函数
+    """
     rgb_dir = os.path.join(dataset_dir, seq_name, "rgb")
     depth_dir = os.path.join(dataset_dir, seq_name, "depth")
     pred_dir = res_dir
 
-    rgb_files = sorted(glob.glob(os.path.join(rgb_dir, "*.png")))
-    depth_files = sorted(glob.glob(os.path.join(depth_dir, "*.png")))
-    gt_files = sorted(glob.glob(os.path.join(gt_dir, "*.txt")))
-    pred_files = sorted(glob.glob(os.path.join(pred_dir, "*.txt")))
-    # print(pred_dir)
-    # print(pred_files)
+    # 1. 建立 GT 和 Pred 的真实 Frame-ID 字典
+    gt_dict = {get_exact_file_number(f): f for f in glob.glob(os.path.join(gt_dir, "*.txt")) if get_exact_file_number(f) >= 0}
+    pred_dict = {get_exact_file_number(f): f for f in glob.glob(os.path.join(pred_dir, "*.txt")) if get_exact_file_number(f) >= 0}
 
-    n_frames = len(gt_files)
-    assert len(rgb_files) == n_frames, f"RGB 数量 ({len(rgb_files)}) 与 GT ({n_frames}) 不一致！"
-    assert len(depth_files) == n_frames, f"Depth 数量 ({len(depth_files)}) 与 GT ({n_frames}) 不一致！"
-    assert len(pred_files) == n_frames, f"Pred 数量 ({len(pred_files)}) 与 GT ({n_frames}) 不一致！"
+    #  断言 1: 严格显式校验 Prediction ID 与 GT Frame-ID 的完全一致性！
+    assert len(gt_dict) > 0, f"错误: [{seq_name}] GT 标注目录为空！"
+    assert len(pred_dict) > 0, f"错误: [{seq_name}] 预测结果目录为空！"
+    assert set(pred_dict.keys()) == set(gt_dict.keys()), \
+        f"错误: [{seq_name}] Pred 帧号集合与 GT 帧号集合不匹配！缺失帧: {set(gt_dict.keys()) ^ set(pred_dict.keys())}"
 
+    # 2. 读取 RGB 与 Depth，按真实时间戳升序排序 (恢复时序流)
+    rgb_files = sorted(glob.glob(os.path.join(rgb_dir, "*.png")), key=extract_timestamp_int)
+    depth_files = sorted(glob.glob(os.path.join(depth_dir, "*.png")), key=extract_timestamp_int)
+    
+    n_frames = len(gt_dict)
+    assert len(rgb_files) == n_frames, f"错误: RGB 帧数 ({len(rgb_files)}) 与 GT 帧数 ({n_frames}) 不一致！"
+    assert len(depth_files) == n_frames, f"错误: Depth 帧数 ({len(depth_files)}) 与 GT 帧数 ({n_frames}) 不一致！"
+
+    # 2: 处理并校验异步硬件时间戳 (Asynchronous Stream Verification)
+    for k in range(n_frames):
+        t_rgb = extract_timestamp_int(rgb_files[k])
+        t_depth = extract_timestamp_int(depth_files[k])
+        # 允许微小硬件时钟偏差 (比如 <= 50ms)，但绝不允许严重漂移！
+        diff_ms = abs(t_rgb - t_depth) / 1000.0 if t_rgb > 1e11 else abs(t_rgb - t_depth)
+        assert diff_ms <= max_async_tolerance_ms, \
+            f"第 {k} 帧 RGB 与 Depth 时间戳偏差过大 ({diff_ms} ms > {max_async_tolerance_ms} ms)！"
+
+    # 3. 构建包含完整 64 位 SHA-256 哈希的权威元数据表
+    sorted_fids = sorted(gt_dict.keys())
     manifest_rows = []
     
-    for k in range(n_frames):
-        rgb_p   = rgb_files[k]
+    for k, fid in enumerate(sorted_fids):
+        rgb_p = rgb_files[k]
         depth_p = depth_files[k]
-        gt_p    = gt_files[k]
-        pred_p  = pred_files[k] # 每一帧都是正确的 pred_files[k]！
-
-        rgb_ts = os.path.basename(rgb_p)
-        depth_ts = os.path.basename(depth_p)
-        assert rgb_ts == depth_ts, f"第 {k} 帧 RGB 与 Depth 时间戳不一致 ({rgb_ts} != {depth_ts})！"
-
-        real_fid = get_exact_file_number(gt_p) # 从当前第 k 个 GT 文件提取真实帧号
+        gt_p = gt_dict[fid]
+        pred_p = pred_dict[fid]
 
         manifest_rows.append({
-            "seq_idx": k,               # 循环顺序: 0, 1, 2, ..., 440
-            "frame_idx": real_fid,      # 真实物理帧号: 0, 1, 5, ..., 525
-            "timestamp": rgb_ts,
+            "seq_idx": k,
+            "frame_idx": fid,
+            "timestamp_rgb": os.path.basename(rgb_p),
+            "timestamp_depth": os.path.basename(depth_p),
             "rgb_path": rgb_p,
             "depth_path": depth_p,
             "gt_path": gt_p,
-            "pred_path": pred_p         # 完美逐帧递增！
+            "pred_path": pred_p,
+            "rgb_sha256": compute_full_sha256(rgb_p),
+            "depth_sha256": compute_full_sha256(depth_p),
+            "gt_sha256": compute_full_sha256(gt_p),
+            "pred_sha256": compute_full_sha256(pred_p)
         })
 
-    # 导出权威 Manifest CSV
+
     df_manifest = pd.DataFrame(manifest_rows)
     df_manifest.to_csv(out_manifest_csv, index=False)
-    print(f"已生成并验证通过: {out_manifest_csv} (共 {n_frames} 帧)")
+    print(f" Manifest 已生成并验证通过: {out_manifest_csv} (共 {n_frames} 帧，包含完整 64 位 SHA-256 校验)")
     
     return df_manifest
 
@@ -336,7 +356,6 @@ def main(args):
     open3d_model = U.toOpen3dCloud(model_pts, colors=np.zeros(model_pts.shape, dtype=np.float64))
 
 
-
     last_name = os.path.basename(args.result_dir)
     df_manifest = build_and_verify_manifest(
         dataset_dir=args.data_dir,
@@ -445,16 +464,13 @@ def main(args):
         # =========================
         # 正常模式
         # =========================
-        elif p_obs_bad <= 0.8:
-            # if 55<i:
-            #  print(i)
+        elif p_obs_bad <= args.p_risk_threshold:
             current_mode = "MODE_1_ACCEPT"
             T_final = T_obs
-        elif p_prior_bad <= 0.8:
+        elif p_prior_bad <= args.p_risk_threshold:
             current_mode = "MODE_2_PRIOR"
             T_final = T_prior_current5 
-        else:
-        
+        else: 
             current_mode="MODE_3_UNCERTAIN_FUSION"
             T_delta = np.linalg.inv(T_prior_current5) @ T_obs
             alpha = 0.5
@@ -664,7 +680,7 @@ if __name__ == "__main__":
     parser.add_argument('--train_seqs', nargs='+', default=["bleach0", "mustard0"], help="训练集包含的序列关键字列表")
     parser.add_argument('--test_base_seq', type=str, default="bleach_hard_00_03_chaitanya", help="测试集物体的基础名称")
     parser.add_argument('--data_dir', type=str, default="./datasets/YCBInEOAT_Corrupted", help="受损数据集基础路径")
-    parser.add_argument('--p_help_threshold', type=float, default=0.50, help="p_help_threshold")
+    parser.add_argument('--p_risk_threshold', type=float, default=0.50, help="p_risk_threshold")
     parser.add_argument('--alpha', type=float, default=0.5, help="B2-alpha")
     parser.add_argument('--risk_threshold', type=float, default=0.5, help="risk_threshold")
     args = parser.parse_args()

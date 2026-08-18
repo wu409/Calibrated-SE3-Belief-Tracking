@@ -9,6 +9,10 @@ import trimesh
 import pyrender
 import argparse
 import open3d  as o3d
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import MinMaxScaler
+
+
 
 K = np.array([
     [3.195820007324218750e+02,    0.0,   3.202149847676955687e+02],
@@ -207,93 +211,129 @@ def main(args):
         d_objs.append(d)
         print(f" 物体 3D 直径 d_obj = {d:.2f} cm")
 
-    obj_idx = 0
+    print("阶段 1: 提取单帧观测特征并训练初级观察模型 clf_obs...")
+    stage1_X_obs = []
+    stage1_y_obs = []
     
+    obj_idx = 0
     for seq_target in args.target_seqs:
         for dot in args.corruption_lists:              
             seq = seq_target + dot            
             pred_dict = build_frame_dict(f"{args.res_dir}/{seq_target}/{seq}")
-            raw_seq_name = seq_target
-            gt_dict = build_frame_dict(f"{args.ycb_dir}/{raw_seq_name}/annotated_poses")
-            print(f"{args.ycb_dir}/{raw_seq_name}/annotated_poses")
-            print(f"{args.data_dir}/{seq}/depth")
-            depth_dict={}
+            gt_dict   = build_frame_dict(f"{args.ycb_dir}/{seq_target}/annotated_poses")
             depth_dict = build_safe_depth_dict(f"{args.data_dir}/{seq}/depth", gt_dict)
             matched_frames = sorted(set(pred_dict.keys()) & set(gt_dict.keys()) & set(depth_dict.keys()))
-            print(f"成功安全对齐帧数: {len(matched_frames)} 帧！")
-            
-            # print(f"{res_dir}/{seq_target}/{seq}/*.txt")
-            history_frames = []
-            history_final = {}
-
-
 
             for frame_id in matched_frames:
-                T_obs=np.loadtxt(pred_dict[frame_id])
-                T_gt=np.loadtxt(gt_dict[frame_id])
-                
-                if len(history_frames)<2: 
-                    T_prior=T_obs     
-                         
-                else:
-                    T_prev1= history_final[history_frames[-1]]
-                    T_prev2= history_final[history_frames[-2]]
-                    delta1 = se3_log_map(np.linalg.inv(T_prev2) @ T_prev1)
-                    T_prior = (T_prev1 @ se3_exp_map(delta1))
-                history_frames.append(frame_id)  
-                
-                # B. 计算两者的绝对 ADD-S 姿态误差 (cm)
-                E_update_cm = U.adi(T_obs, T_gt, open3d_models[obj_idx]) * 100
-                E_prior_cm = U.adi(T_prior, T_gt, open3d_models[obj_idx]) * 100
-
-                # C. 【物体系数归一化】: 除以物体 3D 直径 d_obj
-                e_update_norm = E_update_cm / d_objs[obj_idx]
-                e_prior_norm = E_prior_cm / d_objs[obj_idx]
-                risk_threshold_norml = args.risk_threshold / d_objs[obj_idx]  # 归一化的阈值 
-
-                obs_risk_label = int(e_update_norm > risk_threshold_norml)
-                prior_risk_label = int(e_prior_norm > risk_threshold_norml)
-
+                T_obs = np.loadtxt(pred_dict[frame_id]).reshape(4, 4)
+                T_gt  = np.loadtxt(gt_dict[frame_id]).reshape(4, 4)
                 depth_raw = cv2.imread(depth_dict[frame_id], cv2.IMREAD_UNCHANGED)
                 depth_real = depth_raw.astype(np.float32) / 1000.0
-                if obs_risk_label == 0:
-                    history_final[frame_id] = T_obs
-                elif prior_risk_label == 0:
-                    history_final[frame_id] = T_prior
-                else:
-                    T_delta = np.linalg.inv(T_prior) @ T_obs
-                    alpha = 0.5
-                    T_final = T_prior @ se3_exp_map(alpha * se3_log_map(T_delta))    
-                    history_final[frame_id] = T_final
-            
-                # E. 提取 4 个完全部署级的特征 (无 GT 依赖)
-                
-                x1_depth_residual = reliability_depth_residual(depth_real, T_obs, scenes[obj_idx],renders_obj[obj_idx],mesh_nodes[obj_idx])
 
+                # 计算观察误差与观察标签
+                E_update_cm = U.adi(T_obs, T_gt, open3d_models[obj_idx]) * 100
+                e_update_norm = E_update_cm / d_objs[obj_idx]
+                risk_threshold_norml = args.risk_threshold / d_objs[obj_idx]
+                obs_risk_label = int(e_update_norm > risk_threshold_norml)
+
+                # 提取单帧特征 x1, x4
+                x1_depth_res = reliability_depth_residual(depth_real, T_obs, scenes[obj_idx], renders_obj[obj_idx], mesh_nodes[obj_idx])
+                
+                # 快速支撑率计算
+                R_p, t_p = T_obs[:3, :3], T_obs[:3, 3]
+                pts_cam = (R_p @ models_pts[obj_idx].T).T + t_p
+                u = np.round((K[0, 0] * pts_cam[:, 0] / pts_cam[:, 2]) + K[0, 2]).astype(int)
+                v = np.round((K[1, 1] * pts_cam[:, 1] / pts_cam[:, 2]) + K[1, 2]).astype(int)
+                valid = (u >= 0) & (u < 640) & (v >= 0) & (v < 480) & (pts_cam[:, 2] > 0)
+                Z_real = depth_real[v[valid], u[valid]]
+                x4_support = 1.0 - (np.sum(Z_real > 0.1) / (len(Z_real) + 1e-5)) if len(Z_real) > 0 else 1.0
+
+                stage1_X_obs.append([x1_depth_res, x4_support])
+                stage1_y_obs.append(obs_risk_label)
+        obj_idx += 1
+
+    # 训练第一阶段的 clf_obs (只看单帧特征，完全独立于时序历史!)
+    scaler_obs = MinMaxScaler()
+    X_obs_scaled = scaler_obs.fit_transform(np.array(stage1_X_obs))
+    clf_obs_stage1 = LogisticRegression().fit(X_obs_scaled, np.array(stage1_y_obs))
+    print("✅ 阶段 1 完成: 成功训练纯单帧观察分类器 clf_obs_stage1！\n")
+
+
+    print("阶段 2: 让 B5 自主闭环滚推 (零真值干预)，生成真正的 prior_risk_label 并导出 CSV...")
+    csv_rows = []
+    obj_idx = 0
+
+    for seq_target in args.target_seqs:
+        for dot in args.corruption_lists:              
+            seq = seq_target + dot            
+            pred_dict = build_frame_dict(f"{args.res_dir}/{seq_target}/{seq}")
+            gt_dict   = build_frame_dict(f"{args.ycb_dir}/{seq_target}/annotated_poses")
+            depth_dict = build_safe_depth_dict(f"{args.data_dir}/{seq}/depth", gt_dict)
+            matched_frames = sorted(set(pred_dict.keys()) & set(gt_dict.keys()) & set(depth_dict.keys()))
+
+            T_B5_history = []
+            history_frames = []
+
+            for frame_id in matched_frames:
+                T_obs = np.loadtxt(pred_dict[frame_id]).reshape(4, 4)
+                T_gt  = np.loadtxt(gt_dict[frame_id]).reshape(4, 4)
+                depth_raw = cv2.imread(depth_dict[frame_id], cv2.IMREAD_UNCHANGED)
+                depth_real = depth_raw.astype(np.float32) / 1000.0
+
+                # 1. 提取所有特征
+                x1_depth_residual = reliability_depth_residual(depth_real, T_obs, scenes[obj_idx], renders_obj[obj_idx], mesh_nodes[obj_idx])
+                
                 R_p, t_p = T_obs[:3, :3], T_obs[:3, 3]
                 pts_cam = (R_p @ models_pts[obj_idx].T).T + t_p
                 X, Y, Z = pts_cam[:, 0], pts_cam[:, 1], pts_cam[:, 2]
                 u = np.round((K[0, 0] * X / Z) + K[0, 2]).astype(int)
                 v = np.round((K[1, 1] * Y / Z) + K[1, 2]).astype(int)
                 valid_bounds = (u >= 0) & (u < 640) & (v >= 0) & (v < 480) & (Z > 0)
-                u_v, v_v, Z_p= u[valid_bounds], v[valid_bounds], Z[valid_bounds]
-                projected_mask = np.zeros((480,640), dtype=np.uint8)
-                projected_mask[v_v, u_v] = 1
+                u_v, v_v, Z_p = u[valid_bounds], v[valid_bounds], Z[valid_bounds]
                 Z_real = depth_real[v_v, u_v]
-                valid_depth = Z_real > 0
-                x2_inlier_ratio = reliability_inlier_ratio(valid_depth, Z_p, Z_real)
+                
+                x2_inlier_ratio = reliability_inlier_ratio(Z_real > 0, Z_p, Z_real)
+                x4_support_ratio = 1.0 - (np.sum(Z_real > 0.1) / (len(Z_real) + 1e-5)) if len(Z_real) > 0 else 1.0
 
-                innovation_vec = se3_log_map(np.linalg.inv(T_prior) @ T_obs)
-                x3_innovation_mag = np.linalg.norm(innovation_vec) 
-                x3_trans_innovation = np.linalg.norm(innovation_vec[:3])        
-                x3_rot_innovation = np.linalg.norm(innovation_vec[3:])  # 时序新息模长
-
-                if len(u_v) > 0:                    
-                    x4_support_ratio = 1-(np.sum(Z_real > 0.1) / (len(Z_real) + 1e-5)) # 有效支撑率
+                #  2. 闭环先验 T_prior 完全来自于 B5 过去的自主历史 T_B5_history！
+                if len(T_B5_history) < 2:
+                    T_prior = T_obs
+                    T_final_B5 = T_obs
                 else:
-                    x4_support_ratio = 10.0, 0.0
+                    T_prev1 = T_B5_history[-1]
+                    T_prev2 = T_B5_history[-2]
+                    delta1 = se3_log_map(np.linalg.inv(T_prev2) @ T_prev1)
+                    T_prior = (T_prev1 @ se3_exp_map(delta1))
 
-                # 保存为 CSV 的一行记录
+                    # 3. B5 自身做决策 (使用阶段 1 训练好的模型预测，绝对不看真值 T_gt 做分支选择！)
+                    feat_scaled = scaler_obs.transform([[x1_depth_residual, x4_support_ratio]])
+                    p_obs_bad = clf_obs_stage1.predict_proba(feat_scaled)[0, 1]
+
+                    if p_obs_bad < 0.80:
+                        T_final_B5 = T_obs       # B5 决定听视觉
+                    else:
+                        T_final_B5 = T_prior     # B5 决定听惯性
+
+                T_B5_history.append(T_final_B5)
+                history_frames.append(frame_id)
+
+                # 4. 计算时序新息特征 x3
+                innovation_vec = se3_log_map(np.linalg.inv(T_prior) @ T_obs)
+                x3_innovation_mag = np.linalg.norm(innovation_vec)
+                x3_trans_innovation = np.linalg.norm(innovation_vec[:3])
+                x3_rot_innovation = np.linalg.norm(innovation_vec[3:])
+
+                # 5. 真实打标签：评估两者误差
+                E_update_cm = U.adi(T_obs, T_gt, open3d_models[obj_idx]) * 100
+                E_prior_cm  = U.adi(T_prior, T_gt, open3d_models[obj_idx]) * 100
+
+                e_update_norm = E_update_cm / d_objs[obj_idx]
+                e_prior_norm  = E_prior_cm / d_objs[obj_idx]
+                risk_threshold_norml = args.risk_threshold / d_objs[obj_idx]
+
+                obs_risk_label   = int(e_update_norm > risk_threshold_norml)
+                prior_risk_label = int(e_prior_norm > risk_threshold_norml)
+
                 csv_rows.append({
                     "sequence": seq,
                     "frame_id": frame_id,
@@ -301,115 +341,106 @@ def main(args):
                     "E_prior_cm": E_prior_cm,
                     "e_update_norm": e_update_norm,
                     "e_prior_norm": e_prior_norm,
-                    "obs_risk_label":obs_risk_label,
-                    "prior_risk_label":prior_risk_label,   
+                    "obs_risk_label": obs_risk_label,
+                    "prior_risk_label": prior_risk_label, 
                     "x1_depth_residual": x1_depth_residual,
                     "x2_inlier_ratio": x2_inlier_ratio,
                     "x3_innovation_mag": x3_innovation_mag,
                     "x3_trans_innovation": x3_trans_innovation,
                     "x3_rot_innovation": x3_rot_innovation,
                     "x4_support_ratio": x4_support_ratio,
-                    "D_obj":d_objs[obj_idx]
+                    "D_obj": d_objs[obj_idx]
                 })
-        obj_idx += 1  # 切换到下一个物体的 3D 直径
-
+        obj_idx += 1
 
     for episode in args.ci_episode:
-        seq = args.ci_object + episode
-        pred_dict = build_frame_dict(f"{args.res_dir}/{args.ci_object}/{seq}")
-        raw_seq_name = args.ci_object
-        gt_dict = build_frame_dict(f"{args.ycb_dir}/{raw_seq_name}/annotated_poses")
-        print(f"{args.ycb_dir}/{raw_seq_name}/annotated_poses")
-        print(f"{args.data_dir}/{seq}/depth")
-        depth_dict={}
-        depth_dict = build_safe_depth_dict(f"{args.data_dir}/{seq}/depth", gt_dict)
-        matched_frames = sorted(set(pred_dict.keys()) & set(gt_dict.keys()) & set(depth_dict.keys()))
-        print(f"成功安全对齐帧数: {len(matched_frames)} 帧！")
 
+            seq = args.ci_object + episode           
+            pred_dict = build_frame_dict(f"{args.res_dir}/{args.ci_object}/{seq}")
+            raw_seq_name = args.ci_object
+            gt_dict   = build_frame_dict(f"{args.ycb_dir}/{raw_seq_name}/annotated_poses")
+            depth_dict={}
+            depth_dict = build_safe_depth_dict(f"{args.data_dir}/{seq}/depth", gt_dict)
+            matched_frames = sorted(set(pred_dict.keys()) & set(gt_dict.keys()) & set(depth_dict.keys()))
 
-        # print(f"{res_dir}/{seq_target}/{seq}/*.txt")
-        history_frames = []
-        history_final = {}
-        for frame_id in matched_frames:
-            T_obs=np.loadtxt(pred_dict[frame_id])
-            T_gt=np.loadtxt(gt_dict[frame_id])
-            
-            if len(history_frames)<2: 
-                T_prior=T_obs     
-                        
-            else:
-                T_prev1= history_final[history_frames[-1]]
-                T_prev2= history_final[history_frames[-2]]
-                delta1 = se3_log_map(np.linalg.inv(T_prev2) @ T_prev1)
-                T_prior = (T_prev1 @ se3_exp_map(delta1))
-            history_frames.append(frame_id) 
-            # B. 计算两者的绝对 ADD-S 姿态误差 (cm)
-            E_update_cm = U.adi(T_obs, T_gt, open3d_models[obj_idx]) * 100
-            E_prior_cm = U.adi(T_prior, T_gt, open3d_models[obj_idx]) * 100
+            T_B5_history = []
+            history_frames = []
+            for frame_id in matched_frames:
+                T_obs = np.loadtxt(pred_dict[frame_id]).reshape(4, 4)
+                T_gt  = np.loadtxt(gt_dict[frame_id]).reshape(4, 4)
+                depth_raw = cv2.imread(depth_dict[frame_id], cv2.IMREAD_UNCHANGED)
+                depth_real = depth_raw.astype(np.float32) / 1000.0
+                # 1. 提取所有特征
+                x1_depth_residual = reliability_depth_residual(depth_real, T_obs, scenes[obj_idx], renders_obj[obj_idx], mesh_nodes[obj_idx])
+                
+                R_p, t_p = T_obs[:3, :3], T_obs[:3, 3]
+                pts_cam = (R_p @ models_pts[obj_idx].T).T + t_p
+                X, Y, Z = pts_cam[:, 0], pts_cam[:, 1], pts_cam[:, 2]
+                u = np.round((K[0, 0] * X / Z) + K[0, 2]).astype(int)
+                v = np.round((K[1, 1] * Y / Z) + K[1, 2]).astype(int)
+                valid_bounds = (u >= 0) & (u < 640) & (v >= 0) & (v < 480) & (Z > 0)
+                u_v, v_v, Z_p = u[valid_bounds], v[valid_bounds], Z[valid_bounds]
+                Z_real = depth_real[v_v, u_v]
+                
+                x2_inlier_ratio = reliability_inlier_ratio(Z_real > 0, Z_p, Z_real)
+                x4_support_ratio = 1.0 - (np.sum(Z_real > 0.1) / (len(Z_real) + 1e-5)) if len(Z_real) > 0 else 1.0
 
-            # C. 【物体系数归一化】: 除以物体 3D 直径 d_obj
-            e_update_norm = E_update_cm / d_objs[obj_idx]
-            e_prior_norm = E_prior_cm / d_objs[obj_idx]
-            risk_threshold_norml = args.risk_threshold / d_objs[obj_idx]  # 归一化的阈值 
-            
-            obs_risk_label = int(e_update_norm > risk_threshold_norml)
-            prior_risk_label = int(e_prior_norm > risk_threshold_norml)
-            depth_raw = cv2.imread(depth_dict[frame_id], cv2.IMREAD_UNCHANGED)
-            depth_real = depth_raw.astype(np.float32) / 1000.0
-            if obs_risk_label == 0:
-                history_final[frame_id] = T_obs
-            elif prior_risk_label == 0:
-                history_final[frame_id] = T_prior
-            else:
-                T_delta = np.linalg.inv(T_prior) @ T_obs
-                alpha = 0.5
-                T_final = T_prior @ se3_exp_map(alpha * se3_log_map(T_delta))       
-                history_final[frame_id] = T_final
+                #  2. 闭环先验 T_prior 完全来自于 B5 过去的自主历史 T_B5_history！
+                if len(T_B5_history) < 2:
+                    T_prior = T_obs
+                    T_final_B5 = T_obs
+                else:
+                    T_prev1 = T_B5_history[-1]
+                    T_prev2 = T_B5_history[-2]
+                    delta1 = se3_log_map(np.linalg.inv(T_prev2) @ T_prev1)
+                    T_prior = (T_prev1 @ se3_exp_map(delta1))
 
-            x1_depth_residual = reliability_depth_residual(depth_real, T_obs, scenes[obj_idx],renders_obj[obj_idx],mesh_nodes[obj_idx])
+                    # 3. B5 自身做决策 (使用阶段 1 训练好的模型预测，绝对不看真值 T_gt 做分支选择！)
+                    feat_scaled = scaler_obs.transform([[x1_depth_residual, x4_support_ratio]])
+                    p_obs_bad = clf_obs_stage1.predict_proba(feat_scaled)[0, 1]
 
-            R_p, t_p = T_obs[:3, :3], T_obs[:3, 3]
-            pts_cam = (R_p @ models_pts[obj_idx].T).T + t_p
-            X, Y, Z = pts_cam[:, 0], pts_cam[:, 1], pts_cam[:, 2]
-            u = np.round((K[0, 0] * X / Z) + K[0, 2]).astype(int)
-            v = np.round((K[1, 1] * Y / Z) + K[1, 2]).astype(int)
-            valid_bounds = (u >= 0) & (u < 640) & (v >= 0) & (v < 480) & (Z > 0)
-            u_v, v_v, Z_p= u[valid_bounds], v[valid_bounds], Z[valid_bounds]
-            projected_mask = np.zeros((480,640), dtype=np.uint8)
-            projected_mask[v_v, u_v] = 1
-            Z_real = depth_real[v_v, u_v]
-            valid_depth = Z_real > 0
-            x2_inlier_ratio = reliability_inlier_ratio(valid_depth, Z_p, Z_real)
+                    if p_obs_bad < 0.80:
+                        T_final_B5 = T_obs       # B5 决定听视觉
+                    else:
+                        T_final_B5 = T_prior     # B5 决定听惯性
 
-            innovation_vec = se3_log_map(np.linalg.inv(T_prior) @ T_obs)
-            x3_innovation_mag = np.linalg.norm(innovation_vec) 
-            x3_trans_innovation = np.linalg.norm(innovation_vec[:3])        
-            x3_rot_innovation = np.linalg.norm(innovation_vec[3:])  # 时序新息模长
+                T_B5_history.append(T_final_B5)
+                history_frames.append(frame_id)
 
-            if len(u_v) > 0:                    
-                x4_support_ratio = 1-(np.sum(Z_real > 0.1) / (len(Z_real) + 1e-5)) # 有效支撑率
-            else:
-                x4_support_ratio = 10.0, 0.0
+                # 4. 计算时序新息特征 x3
+                innovation_vec = se3_log_map(np.linalg.inv(T_prior) @ T_obs)
+                x3_innovation_mag = np.linalg.norm(innovation_vec)
+                x3_trans_innovation = np.linalg.norm(innovation_vec[:3])
+                x3_rot_innovation = np.linalg.norm(innovation_vec[3:])
 
-            # 保存为 CSV 的一行记录
-            csv_rows.append({
-                "sequence": seq,
-                "frame_id": frame_id,
-                "E_update_cm": E_update_cm,
-                "E_prior_cm": E_prior_cm,
-                "e_update_norm": e_update_norm,
-                "e_prior_norm": e_prior_norm,
-                "obs_risk_label":obs_risk_label,
-                "prior_risk_label":prior_risk_label,                  
-                "x1_depth_residual": x1_depth_residual,
-                "x2_inlier_ratio": x2_inlier_ratio,
-                "x3_innovation_mag": x3_innovation_mag,
-                "x3_trans_innovation": x3_trans_innovation,
-                "x3_rot_innovation": x3_rot_innovation,
-                "x4_support_ratio": x4_support_ratio,
-                "D_obj":d_objs[obj_idx]
-            })
+                # 5. 真实打标签：评估两者误差
+                E_update_cm = U.adi(T_obs, T_gt, open3d_models[obj_idx]) * 100
+                E_prior_cm  = U.adi(T_prior, T_gt, open3d_models[obj_idx]) * 100
 
+                e_update_norm = E_update_cm / d_objs[obj_idx]
+                e_prior_norm  = E_prior_cm / d_objs[obj_idx]
+                risk_threshold_norml = args.risk_threshold / d_objs[obj_idx]
+
+                obs_risk_label   = int(e_update_norm > risk_threshold_norml)
+                prior_risk_label = int(e_prior_norm > risk_threshold_norml)
+
+                csv_rows.append({
+                    "sequence": seq,
+                    "frame_id": frame_id,
+                    "E_update_cm": E_update_cm,
+                    "E_prior_cm": E_prior_cm,
+                    "e_update_norm": e_update_norm,
+                    "e_prior_norm": e_prior_norm,
+                    "obs_risk_label": obs_risk_label,
+                    "prior_risk_label": prior_risk_label, 
+                    "x1_depth_residual": x1_depth_residual,
+                    "x2_inlier_ratio": x2_inlier_ratio,
+                    "x3_innovation_mag": x3_innovation_mag,
+                    "x3_trans_innovation": x3_trans_innovation,
+                    "x3_rot_innovation": x3_rot_innovation,
+                    "x4_support_ratio": x4_support_ratio,
+                    "D_obj": d_objs[obj_idx]
+                })
 
     # 导出为表格文件
     df = pd.DataFrame(csv_rows)
