@@ -1,5 +1,4 @@
 import os
-import glob
 import numpy as np
 import open3d as o3d
 import cv2
@@ -7,6 +6,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import MinMaxScaler
+from b5_policy import se3_log_map, se3_exp_map, compute_se3_prior, init_b5_state, b5_transition
 import Utils as U
 from scipy.spatial.transform import Rotation as R_sci
 from scipy.optimize import minimize
@@ -15,7 +15,6 @@ from collections import Counter
 from sklearn.metrics import roc_auc_score, precision_recall_curve, auc, brier_score_loss
 import argparse
 from scipy.stats import t
-import re
 import hashlib
 import pandas as pd
 
@@ -27,23 +26,6 @@ K = np.array([
 ], dtype=np.float64)
 
 # ==================== 1. SE(3) 李群辅助函数 ====================
-def se3_log_map(T):
-    R_mat, t_vec = T[:3, :3], T[:3, 3]
-    w_vec = R_sci.from_matrix(R_mat).as_rotvec()
-    return np.concatenate([t_vec, w_vec])
-
-def se3_exp_map(delta):
-    t_vec, w_vec = delta[:3], delta[3:]
-    R_mat = R_sci.from_rotvec(w_vec).as_matrix()
-    T = np.eye(4, dtype=np.float64)
-    T[:3, :3] = R_mat
-    T[:3, 3] = t_vec
-    return T
-
-def compute_se3_prior(T_prev1, T_prev2):
-    delta = se3_log_map(np.linalg.inv(T_prev2) @ T_prev1)
-    return T_prev1 @ se3_exp_map(delta)
-
 def calc_auc(errors_cm, max_threshold_cm=10.0):
     errors_array = np.array(errors_cm)
     if len(errors_array) == 0: return 0.0
@@ -99,118 +81,6 @@ def compute_paired_bootstrap_ci(differences, n_bootstraps=10000, confidence_leve
     alpha = (1.0 - confidence_level) / 2.0
     return mean_diff, float(np.percentile(boot_means, alpha * 100)), float(np.percentile(boot_means, (1.0 - alpha) * 100))
 
-def actual_recovery_action(current_depth_real, model_pts_3d, K):  
-   
-    y_idx, x_idx = np.where((current_depth_real > 0.5) & (current_depth_real < 1.2))
-
-    if len(y_idx) < 300:
-        print("[Recovery] 有效深度点过少，恢复失败！")
-        return None, False
-
-    z = current_depth_real[y_idx, x_idx]
-    x = (x_idx - K[0, 2]) * z / K[0, 0]
-    y = (y_idx - K[1, 2]) * z / K[1, 1]
-
-    scene_pts = np.vstack([x, y, z]).T
-    pcd_scene = o3d.geometry.PointCloud()
-    pcd_scene.points = o3d.utility.Vector3dVector(scene_pts)
-
-  
-    plane_model, inliers = pcd_scene.segment_plane(distance_threshold=0.015, ransac_n=3, num_iterations=500)
-    
-    
-    pcd_objects = pcd_scene.select_by_index(inliers, invert=True)
-
-    if len(pcd_objects.points) < 50:
-        pcd_objects = pcd_scene # 兜底
-
-    obj_pts = np.asarray(pcd_objects.points)
-    real_bottle_center = np.median(obj_pts, axis=0) # 真实的瓶子 3D 坐标！
-
-    # 构建粗姿态 T_coarse
-    model_center = np.mean(model_pts_3d, axis=0)
-    T_coarse = np.eye(4)
-    T_coarse[:3, 3] = (real_bottle_center - model_center)
-
-    pcd_model = o3d.geometry.PointCloud()
-    pcd_model.points = o3d.utility.Vector3dVector(model_pts_3d)
-
-    icp_result = o3d.pipelines.registration.registration_icp(
-        pcd_model,
-        pcd_objects,
-        max_correspondence_distance=0.10, # 10cm 抓取半径
-        init=T_coarse,
-        estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPoint()
-    )
-
-    if icp_result.fitness < 0.15:
-        print("ICP recovery failed")
-        return None, False
-
-    print(" ICP 恢复成功! Fitness:", icp_result.fitness)
-    return icp_result.transformation, True
-
-
-def b5_transition(T_obs, T_prior, p_obs_bad, p_prior_bad, support, depth_real, model_pts,
-                  p_risk_threshold, frame_index, frame_id, state, blackout_min_frames=10):
-    """
-    Shared B5 transition/decision function.
-
-    State fields:
-      consecutive_blackout, exited_blackout,
-      blackout_start_idx, blackout_end_idx,
-      blackout_start_frame, blackout_end_frame
-
-    Returns:
-      T_final, current_mode, updated_state, recovery_info
-    """
-    state = dict(state)
-    recovery_info = None
-
-    if support == 1:
-        state["consecutive_blackout"] += 1
-        if state["consecutive_blackout"] == 1:
-            state["blackout_start_idx"] = frame_index
-            state["blackout_start_frame"] = frame_id
-    else:
-        if state["consecutive_blackout"] >= blackout_min_frames:
-            state["exited_blackout"] = True
-            state["blackout_end_idx"] = frame_index
-            state["blackout_end_frame"] = frame_id
-        state["consecutive_blackout"] = 0
-
-    if support == 1:
-        current_mode = "MODE_3_BLACKOUT_WAITING"
-        T_final = T_prior
-    elif state["exited_blackout"]:
-        print("恢复帧数", frame_id)
-        T_recovery, recovery_ok = actual_recovery_action(depth_real, model_pts, K)
-        recovery_info = {
-            "recovery_frame": frame_id,
-            "recovery_frame_index": frame_index,
-            "recovery_success": bool(recovery_ok),
-            "T_recovery": T_recovery.copy() if recovery_ok else None
-        }
-        if recovery_ok:
-            T_final = T_recovery
-        else:
-            T_final = T_prior
-        current_mode = "MODE_3_RECOVERY_EXECUTE"
-        state["exited_blackout"] = False
-    elif p_obs_bad <= p_risk_threshold:
-        current_mode = "MODE_1_ACCEPT"
-        T_final = T_obs
-    elif p_prior_bad <= p_risk_threshold:
-        current_mode = "MODE_2_PRIOR"
-        T_final = T_prior
-    else:
-        current_mode = "MODE_3_UNCERTAIN_FUSION"
-        T_delta = np.linalg.inv(T_prior) @ T_obs
-        alpha = 0.5
-        T_final = T_prior @ se3_exp_map(alpha * se3_log_map(T_delta))
-
-    return T_final, current_mode, state, recovery_info
-
 def compute_full_sha256(filepath):
     """计算文件的完整 64 位 SHA-256 哈希值 (读全量数据，绝不截断)"""
     hasher = hashlib.sha256()
@@ -218,87 +88,6 @@ def compute_full_sha256(filepath):
         while chunk := f.read(65536):
             hasher.update(chunk)
     return hasher.hexdigest()
-
-def get_exact_file_number(filepath):
-    """只从文件名提取纯数字 ID (如 000150.txt -> 150)"""
-    filename = os.path.basename(filepath)
-    digits = re.findall(r'\d+', filename)
-    return int(digits[-1]) if len(digits) > 0 else -1
-
-def extract_timestamp_int(filepath):
-    """从时间戳文件名提取纯数字时间戳"""
-    filename = os.path.basename(filepath)
-    digits = ''.join(filter(str.isdigit, filename))
-    return int(digits) if len(digits) > 0 else 0
-
-def build_and_verify_manifest(dataset_dir, seq_name, res_dir, gt_dir, out_manifest_csv="./manifest.csv", max_async_tolerance_ms=50):
-    """
-    权威的 4 模态 (RGB, Depth, GT, Pred) 严格对齐、异步时间戳关联与完整 Hash 校验函数
-    """
-    rgb_dir = os.path.join(dataset_dir, seq_name, "rgb")
-    depth_dir = os.path.join(dataset_dir, seq_name, "depth")
-    pred_dir = res_dir
-
-    # 1. 建立 GT 和 Pred 的真实 Frame-ID 字典
-    gt_dict = {get_exact_file_number(f): f for f in glob.glob(os.path.join(gt_dir, "*.txt")) if get_exact_file_number(f) >= 0}
-    pred_dict = {get_exact_file_number(f): f for f in glob.glob(os.path.join(pred_dir, "*.txt")) if get_exact_file_number(f) >= 0}
-
-    #  断言 1: 严格显式校验 Prediction ID 与 GT Frame-ID 的完全一致性！
-    assert len(gt_dict) > 0, f"错误: [{seq_name}] GT 标注目录为空！"
-    assert len(pred_dict) > 0, f"错误: [{seq_name}] 预测结果目录为空！"
-    assert set(pred_dict.keys()) == set(gt_dict.keys()), \
-        f"错误: [{seq_name}] Pred 帧号集合与 GT 帧号集合不匹配！缺失帧: {set(gt_dict.keys()) ^ set(pred_dict.keys())}"
-
-    # 2. 读取 RGB 与 Depth，按真实时间戳升序排序 (恢复时序流)
-    rgb_files = sorted(glob.glob(os.path.join(rgb_dir, "*.png")), key=extract_timestamp_int)
-    depth_files = sorted(glob.glob(os.path.join(depth_dir, "*.png")), key=extract_timestamp_int)
-    
-    n_frames = len(gt_dict)
-    assert len(rgb_files) == n_frames, f"错误: RGB 帧数 ({len(rgb_files)}) 与 GT 帧数 ({n_frames}) 不一致！"
-    assert len(depth_files) == n_frames, f"错误: Depth 帧数 ({len(depth_files)}) 与 GT 帧数 ({n_frames}) 不一致！"
-
-    # 2: 处理并校验异步硬件时间戳 (Asynchronous Stream Verification)
-    for k in range(n_frames):
-        t_rgb = extract_timestamp_int(rgb_files[k])
-        t_depth = extract_timestamp_int(depth_files[k])
-        # 允许微小硬件时钟偏差 (比如 <= 50ms)，但绝不允许严重漂移！
-        diff_ms = abs(t_rgb - t_depth) / 1000.0 if t_rgb > 1e11 else abs(t_rgb - t_depth)
-        assert diff_ms <= max_async_tolerance_ms, \
-            f"第 {k} 帧 RGB 与 Depth 时间戳偏差过大 ({diff_ms} ms > {max_async_tolerance_ms} ms)！"
-
-    # 3. 构建包含完整 64 位 SHA-256 哈希的权威元数据表
-    sorted_fids = sorted(gt_dict.keys())
-    manifest_rows = []
-    
-    for k, fid in enumerate(sorted_fids):
-        rgb_p = rgb_files[k]
-        depth_p = depth_files[k]
-        gt_p = gt_dict[fid]
-        pred_p = pred_dict[fid]
-
-        manifest_rows.append({
-            "seq_idx": k,
-            "frame_idx": fid,
-            "timestamp_rgb": os.path.basename(rgb_p),
-            "timestamp_depth": os.path.basename(depth_p),
-            "rgb_path": rgb_p,
-            "depth_path": depth_p,
-            "gt_path": gt_p,
-            "pred_path": pred_p,
-            "rgb_sha256": compute_full_sha256(rgb_p),
-            "depth_sha256": compute_full_sha256(depth_p),
-            "gt_sha256": compute_full_sha256(gt_p),
-            "pred_sha256": compute_full_sha256(pred_p)
-        })
-
-
-    df_manifest = pd.DataFrame(manifest_rows)
-    df_manifest.to_csv(out_manifest_csv, index=False)
-    print(f" Manifest 已生成并验证通过: {out_manifest_csv} (共 {n_frames} 帧，包含完整 64 位 SHA-256 校验)")
-    
-    return df_manifest
-
-
 
 def resolve_manifest_path(path_value, manifest_path):
     """兼容 manifest 中的绝对路径或相对路径。"""
@@ -310,10 +99,15 @@ def resolve_manifest_path(path_value, manifest_path):
 
 def load_episode_manifest(manifest_path, sequence, data_dir, gt_dir, result_dir):
     """
-    从已经建立好的 dataset_manifest_all.csv 中按 exact sequence 取出一个 episode。
+    从冻结的 reference manifest 中按 exact sequence 取出一个 episode。
+    本函数只消费 reference，并再次检查实际 path + SHA-256；不会重建映射。
     """
     df_manifest = pd.read_csv(manifest_path)
-    required = {"sequence", "frame_id", "depth_path", "gt_path", "pred_path"}
+    required = {
+        "sequence", "sequence_index", "frame_id", "depth_path", "gt_path", "pred_path",
+        "depth_sha256", "gt_sha256", "pred_sha256",
+        "association_method", "association_reference", "association_description",
+    }
     missing = required - set(df_manifest.columns)
     if missing:
         raise ValueError(f"Master manifest 缺少字段: {sorted(missing)}")
@@ -321,11 +115,24 @@ def load_episode_manifest(manifest_path, sequence, data_dir, gt_dir, result_dir)
     if len(episode) == 0:
         raise ValueError(f"Master manifest 中找不到 episode: {sequence}")
     episode["frame_id"] = episode["frame_id"].astype(int)
+    episode["sequence_index"] = episode["sequence_index"].astype(int)
     if episode["frame_id"].duplicated().any():
         dup = episode.loc[episode["frame_id"].duplicated(), "frame_id"].tolist()
         raise ValueError(f"[{sequence}] manifest 存在重复 frame_id: {dup}")
-    episode = episode.sort_values("frame_id").reset_index(drop=True)
-    episode["seq_idx"] = np.arange(len(episode), dtype=int)
+    if episode["sequence_index"].duplicated().any():
+        dup = episode.loc[episode["sequence_index"].duplicated(), "sequence_index"].tolist()
+        raise ValueError(f"[{sequence}] manifest 存在重复 sequence_index: {dup}")
+    episode = episode.sort_values("sequence_index", kind="stable").reset_index(drop=True)
+    expected_indices = list(range(len(episode)))
+    if episode["sequence_index"].tolist() != expected_indices:
+        raise ValueError(
+            f"[{sequence}] manifest sequence_index不连续: "
+            f"expected={expected_indices[:10]}, actual={episode['sequence_index'].tolist()[:10]}"
+        )
+    methods = episode["association_method"].dropna().unique().tolist()
+    if methods != ["official_ycbineoat_reference_sorted_index"]:
+        raise ValueError(f"[{sequence}] manifest association_method不受支持: {methods}")
+    episode["seq_idx"] = episode["sequence_index"]
     episode["frame_idx"] = episode["frame_id"]
 
     episode["depth_path"] = episode["depth_path"].map(lambda x: os.path.join(data_dir, x))
@@ -336,6 +143,17 @@ def load_episode_manifest(manifest_path, sequence, data_dir, gt_dir, result_dir)
         missing_paths = [p for p in episode[col].tolist() if not os.path.exists(p)]
         if missing_paths:
             raise FileNotFoundError(f"[{sequence}] {col} 中存在不存在的文件，例如: {missing_paths[0]}")
+    for row in episode.itertuples(index=False):
+        for artifact_type in ["depth", "gt", "pred"]:
+            path = getattr(row, f"{artifact_type}_path")
+            expected = str(getattr(row, f"{artifact_type}_sha256")).lower()
+            actual = compute_full_sha256(path)
+            if actual != expected:
+                raise ValueError(
+                    f"[{sequence} frame {row.frame_id}] {artifact_type} SHA-256 mismatch: "
+                    f"expected={expected}, actual={actual}, path={path}"
+                )
+    print(f"[{sequence}] manifest paths and SHA-256 values verified: {len(episode)} frames")
     return episode
 
 def main(args):
@@ -347,6 +165,13 @@ def main(args):
     # ==================== 2. 载入数据集与训练好的风险分类器 ====================
     print("正在载入 CSV 数据集并训练分类器...")
     df = pd.read_csv(args.csv_path)
+    required_label_columns = {"sequence", "frame_id", "obs_risk_label", "prior_risk_label"}
+    missing_label_columns = required_label_columns - set(df.columns)
+    if missing_label_columns:
+        raise ValueError(f"Label CSV 缺少字段: {sorted(missing_label_columns)}")
+    if df.duplicated(["sequence", "frame_id"]).any():
+        duplicated = df.loc[df.duplicated(["sequence", "frame_id"], keep=False), ["sequence", "frame_id"]]
+        raise ValueError(f"Label CSV 存在重复(sequence, frame_id): {duplicated.head(10).to_dict('records')}")
     path = args.result_dir
     test_seq = os.path.basename(path)
     train_pattern = "|".join(args.train_seqs)
@@ -362,13 +187,15 @@ def main(args):
         split_idx = int(len(sub_df) * 0.7) # 70% 时间截断点
         
         train_dfs.append(sub_df.iloc[:split_idx]) # 前 70% 时间段进入训练集
-        cal_dfs.append(sub_df.iloc[split_idx:])   # 后 320% 时间段进入校准集
+        cal_dfs.append(sub_df.iloc[split_idx:])   # 后 30% 时间段进入校准集
 
     train_df = pd.concat(train_dfs)
     cal_df   = pd.concat(cal_dfs)
 
     test_df = df[df['sequence'] == test_seq].copy()
     test_df['frame_id'] = test_df['frame_id'].astype(int)
+    if test_df['frame_id'].duplicated().any():
+        raise ValueError(f"测试序列 {test_seq} 存在重复 frame_id，拒绝构建概率字典")
     test_df = test_df.set_index('frame_id')
 
     test_ALL_df = df[df['sequence'].str.contains(args.test_base_seq)]
@@ -498,14 +325,7 @@ def main(args):
     false_recovery_triggers = 0
     recovery_latencies1,recovery_latencies2,recovery_latencies3,recovery_latencies4,recovery_latencies5,recovery_latencies6 = [],[],[],[],[],[] # 记录恢复延迟
     T_history2,T_history3,T_history4,T_history5,T_history6 =  [], [], [], [], []
-    b5_state = {
-        "consecutive_blackout": 0,
-        "exited_blackout": False,
-        "blackout_start_idx": 0,
-        "blackout_end_idx": int(1e10),
-        "blackout_start_frame": None,
-        "blackout_end_frame": None
-    }
+    b5_state = init_b5_state()
     recovery_record = None
 
 
@@ -567,7 +387,6 @@ def main(args):
         b4_errs.append(U.adi(T_huber,T_gt,open3d_model)* 100)
 
         #  B5: Proposed Three-Mode Policy
-        # 统一调用 b5_transition()，避免 label rollout / evaluation 使用不同决策实现。
         depth_real = depth_raw.astype(np.float32) / 1000.0
         T_final, current_mode, b5_state, recovery_info = b5_transition(
             T_obs=T_obs,
@@ -577,11 +396,13 @@ def main(args):
             support=support,
             depth_real=depth_real,
             model_pts=model_pts,
+            K=K,
             p_risk_threshold=args.p_risk_threshold,
             frame_index=i,
             frame_id=frame_id,
             state=b5_state,
-            blackout_min_frames=args.blackout_min_frames
+            blackout_min_frames=args.blackout_min_frames,
+            use_prior_predictor=True
         )
 
         T_history5.append(T_final)
@@ -626,7 +447,8 @@ def main(args):
     blackout_end = b5_state["blackout_end_idx"]
     print(Counter(b5_modes))
     print("black_start:", blackout_start, "| frame:", b5_state["blackout_start_frame"])
-    print("black_end:", blackout_end, "| recovery frame:", b5_state["blackout_end_frame"])
+    print("black_end:", b5_state["last_blackout_idx"], "| frame:", b5_state["blackout_end_frame"])
+    print("recovery_index:", blackout_end, "| frame:", b5_state["recovery_frame"])
     # print(b5_errs[42:200])
 
     # ==================== 动作 A: 测量 【恢复延迟 Recovery Latency】 ====================
@@ -789,13 +611,21 @@ def main(args):
     prob_metrics_prior = {'auroc_prior': auroc_prior,'auprc_prior': auprc_prior,'brier_prior': brier_prior,'ece_prior': ece_prior,'temp_factor_prior': temp_factor_prior} 
     
 
-    return adds_scores, fail_rates, latency_scores, false_triggers, prob_metrics_obs, prob_metrics_prior, recovery_record
+    blackout_intervals = []
+    for interval in b5_state["blackout_intervals"]:
+        interval_record = {"episode": last_name}
+        interval_record.update(interval)
+        blackout_intervals.append(interval_record)
+
+    return (adds_scores, fail_rates, latency_scores, false_triggers, prob_metrics_obs,
+            prob_metrics_prior, recovery_record, blackout_intervals)
             
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--csv_path', type=str, default="./per_frame_label_threshold0.5.csv", help="csv数据集路径")
-    parser.add_argument('--manifest_path', type=str, default="./dataset_manifest_all.csv", help="统一数据manifest")
+    parser.add_argument('--csv_path', type=str, default="./per_frame_label_threshold1.0.csv", help="csv数据集路径")
+    parser.add_argument('--manifest_path', type=str, default="./reference_manifest.csv",
+                        help="冻结的 reference manifest（只读，不在 evaluation 中重建）")
     parser.add_argument('--result_dir', nargs='+',type=str, default=["./results_collection/bleach_hard_00_03_chaitanya/bleach_hard_00_03_chaitanya_black10",
                                                                      "./results_collection/bleach_hard_00_03_chaitanya/bleach_hard_00_03_chaitanya_black10_2",
                                                                      "./results_collection/bleach_hard_00_03_chaitanya/bleach_hard_00_03_chaitanya_black10_3",
@@ -809,7 +639,7 @@ if __name__ == "__main__":
     parser.add_argument('--data_dir', type=str, default="./datasets/YCBInEOAT_Corrupted", help="受损数据集基础路径")
     parser.add_argument('--p_risk_threshold', type=float,  default=0.80, help="B5 risk probability threshold")
     parser.add_argument('--alpha', type=float, default=0.5, help="B2-alpha")
-    parser.add_argument('--risk_threshold', type=float, default=0.5, help="risk_threshold")
+    parser.add_argument('--risk_threshold', type=float, default=1.0, help="risk_threshold")
     parser.add_argument('--blackout_min_frames', type=int, default=10, help="触发blackout recovery所需连续blackout帧数")
     parser.add_argument('--bootstrap_samples', type=int, default=10000, help="paired episode bootstrap次数")
     parser.add_argument('--seed', type=int, default=42, help="随机种子")
@@ -829,6 +659,7 @@ if __name__ == "__main__":
     LATENCY_dict = {}
     TRIGGER_dict = {}
     RECOVERY_dict = {}
+    BLACKOUT_INTERVALS_dict = {}
     
     last_prob_metrics_obs = None # 用于保存概率标定指标
     last_prob_metrics_prior = None
@@ -842,13 +673,15 @@ if __name__ == "__main__":
         print(f"\n正在评估 Episode: {basename} ...")
         
         # 接收 main(args) 返回的 5 个元组/列表！
-        adds_s, fails, lats, fts, prob_metrics_obs, prob_metrics_prior, recovery_record = main(args)
+        (adds_s, fails, lats, fts, prob_metrics_obs, prob_metrics_prior,
+         recovery_record, blackout_intervals) = main(args)
         
         ADDS_dict[basename] = adds_s
         FAIL_dict[basename] = fails
         LATENCY_dict[basename] = lats
         TRIGGER_dict[basename] = fts
         RECOVERY_dict[basename] = recovery_record
+        BLACKOUT_INTERVALS_dict[basename] = blackout_intervals
         last_prob_metrics_obs = prob_metrics_obs # 记录概率指标
         last_prob_metrics_prior = prob_metrics_prior 
 
@@ -879,6 +712,20 @@ if __name__ == "__main__":
     blackout_eps = [ep for ep in ADDS_dict.keys() if "black" in ep.lower()]
     if len(blackout_eps) != 5:
         print(f"paired AUC 预期 5 个 blackout episodes, 当前得到 {len(blackout_eps)} 个: {blackout_eps}")
+
+    if blackout_eps:
+        interval_rows = []
+        for episode in blackout_eps:
+            episode_intervals = BLACKOUT_INTERVALS_dict.get(episode, [])
+            if len(episode_intervals) != 1:
+                raise RuntimeError(
+                    f"[{episode}] expected exactly one validated blackout interval, "
+                    f"found {len(episode_intervals)}"
+                )
+            interval_rows.extend(episode_intervals)
+        blackout_interval_path = f"./checkpoint2_blackout_frame_intervals_threshold{args.risk_threshold}.csv"
+        pd.DataFrame(interval_rows).to_csv(blackout_interval_path, index=False)
+        print(f"Exact blackout frame intervals saved: {blackout_interval_path}")
 
     paired_auc_rows = []
     auc_differences = []

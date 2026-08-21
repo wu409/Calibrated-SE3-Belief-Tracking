@@ -1,4 +1,5 @@
 import os
+import hashlib
 import numpy as np
 import pandas as pd
 import cv2
@@ -10,6 +11,9 @@ import argparse
 import open3d as o3d
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import MinMaxScaler
+from b5_policy import se3_log_map, compute_se3_prior, init_b5_state, b5_transition
+
+
 
 K = np.array([
     [3.195820007324218750e+02, 0.0, 3.202149847676955687e+02],
@@ -23,18 +27,6 @@ cv_to_gl = np.array([
     [0, 0, -1, 0],
     [0, 0, 0, 1]
 ])
-
-def se3_log_map(T):
-    R_mat = T[:3, :3]
-    t_vec = T[:3, 3]
-    w_vec = R_sci.from_matrix(R_mat).as_rotvec()
-    return np.concatenate([t_vec, w_vec])
-
-def se3_exp_map(delta):
-    T = np.eye(4, dtype=np.float64)
-    T[:3, :3] = R_sci.from_rotvec(delta[3:]).as_matrix()
-    T[:3, 3] = delta[:3]
-    return T
 
 def reliability_depth_residual(depth_real, pred_pose, scene, renderer, mesh_node):
     pose_render = cv_to_gl @ pred_pose
@@ -54,59 +46,6 @@ def reliability_inlier_ratio(valid_depth, Z_pred, Z_real):
         return 1 - np.mean(depth_diff < 2.0)
     return 1.0
 
-def actual_recovery_action(current_depth_real, model_pts_3d, K):
-    y_idx, x_idx = np.where((current_depth_real > 0.5) & (current_depth_real < 1.2))
-    if len(y_idx) < 300:
-        print("[Recovery] 有效深度点过少，恢复失败")
-        return None, False
-    z = current_depth_real[y_idx, x_idx]
-    x = (x_idx - K[0, 2]) * z / K[0, 0]
-    y = (y_idx - K[1, 2]) * z / K[1, 1]
-    scene_pts = np.vstack([x, y, z]).T
-    pcd_scene = o3d.geometry.PointCloud()
-    pcd_scene.points = o3d.utility.Vector3dVector(scene_pts)
-    _, inliers = pcd_scene.segment_plane(distance_threshold=0.015, ransac_n=3, num_iterations=500)
-    pcd_objects = pcd_scene.select_by_index(inliers, invert=True)
-    if len(pcd_objects.points) < 50:
-        pcd_objects = pcd_scene
-    obj_pts = np.asarray(pcd_objects.points)
-    real_object_center = np.median(obj_pts, axis=0)
-    model_center = np.mean(model_pts_3d, axis=0)
-    T_coarse = np.eye(4)
-    T_coarse[:3, 3] = real_object_center - model_center
-    pcd_model = o3d.geometry.PointCloud()
-    pcd_model.points = o3d.utility.Vector3dVector(model_pts_3d)
-    icp_result = o3d.pipelines.registration.registration_icp(
-        pcd_model, pcd_objects, max_correspondence_distance=0.10, init=T_coarse,
-        estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPoint()
-    )
-    if icp_result.fitness < 0.15:
-        print("[Recovery] ICP recovery failed")
-        return None, False
-    return icp_result.transformation, True
-
-def b5_transition(T_obs, T_prior, p_obs_bad, p_prior_bad, p_risk_threshold,
-                  support, exited_blackout, depth_real, model_pts,
-                  use_prior_predictor=True):
-
-    if support == 1:
-        return T_prior, "MODE_3_BLACKOUT_WAITING"
-    if exited_blackout:
-        T_recovery, ok = actual_recovery_action(depth_real, model_pts, K)
-        if ok:
-            return T_recovery, "MODE_3_RECOVERY_EXECUTE"
-        return T_prior, "MODE_3_RECOVERY_FAILED_PRIOR"
-    if p_obs_bad <= p_risk_threshold:
-        return T_obs, "MODE_1_ACCEPT"
-    if use_prior_predictor:
-        if p_prior_bad <= p_risk_threshold:
-            return T_prior, "MODE_2_PRIOR"
-        T_delta = np.linalg.inv(T_prior) @ T_obs
-        alpha = 0.5
-        T_final = T_prior @ se3_exp_map(alpha * se3_log_map(T_delta))
-        return T_final, "MODE_3_UNCERTAIN_FUSION"
-    return T_prior, "MODE_BOOTSTRAP_PRIOR"
-
 def resolve_path(path_value, root):
     path_value = str(path_value)
     if os.path.isabs(path_value):
@@ -115,15 +54,60 @@ def resolve_path(path_value, root):
         return path_value
     return os.path.normpath(os.path.join(root, path_value))
 
+def compute_sha256(path):
+    hasher = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+def verify_manifest_artifacts(manifest, args):
+    """Second-line defense for the already frozen reference manifest."""
+    roots = {
+        "rgb": args.data_dir,
+        "depth": args.data_dir,
+        "gt": args.ycb_dir,
+        "pred": args.res_dir,
+    }
+    verified = {}
+    for row in manifest.itertuples(index=False):
+        for artifact_type, root in roots.items():
+            path = resolve_path(getattr(row, f"{artifact_type}_path"), root)
+            expected = str(getattr(row, f"{artifact_type}_sha256")).lower()
+            if not os.path.isfile(path):
+                raise FileNotFoundError(
+                    f"[{row.sequence} frame {row.frame_id}] missing {artifact_type} artifact: {path}"
+                )
+            actual = verified.get(os.path.abspath(path))
+            if actual is None:
+                actual = compute_sha256(path)
+                verified[os.path.abspath(path)] = actual
+            if actual != expected:
+                raise ValueError(
+                    f"[{row.sequence} frame {row.frame_id}] {artifact_type} SHA-256 mismatch: "
+                    f"expected={expected}, actual={actual}, path={path}"
+                )
+    print(f"Manifest artifact verification passed: {len(verified)} unique files")
+
 def get_episode_df(manifest, seq):
     episode_df = manifest[manifest["sequence"] == seq].copy()
     if len(episode_df) == 0:
         raise ValueError(f"Manifest中找不到序列: {seq}")
     episode_df["frame_id"] = episode_df["frame_id"].astype(int)
-    episode_df = episode_df.sort_values("frame_id")
+    episode_df["sequence_index"] = episode_df["sequence_index"].astype(int)
     if episode_df["frame_id"].duplicated().any():
         dup = episode_df.loc[episode_df["frame_id"].duplicated(), "frame_id"].tolist()
         raise ValueError(f"{seq} 存在重复frame_id: {dup}")
+    if episode_df["sequence_index"].duplicated().any():
+        dup = episode_df.loc[episode_df["sequence_index"].duplicated(), "sequence_index"].tolist()
+        raise ValueError(f"{seq} 存在重复sequence_index: {dup}")
+    episode_df = episode_df.sort_values("sequence_index", kind="stable").reset_index(drop=True)
+    expected_indices = list(range(len(episode_df)))
+    if episode_df["sequence_index"].tolist() != expected_indices:
+        raise ValueError(
+            f"{seq} manifest sequence_index不连续: "
+            f"expected={expected_indices[:10]}, actual={episode_df['sequence_index'].tolist()[:10]}"
+        )
     return episode_df
 
 def load_frame_from_manifest(row, args):
@@ -189,30 +173,21 @@ def rollout_episode(episode_df, seq, obj_idx, args, models_pts, scenes, renders_
                     use_prior_predictor=False):
     rows = []
     T_B5_history = []
-    consecutive_blackout = 0
-    exited_blackout = False
-    steps_since_reset = 0
-    feature_cols = ['x1_depth_residual', 'x2_inlier_ratio', 'x3_innovation_mag', 'x4_support_ratio']
+    b5_state = init_b5_state()
 
-    for _, row in episode_df.iterrows():
+    for frame_index, (_, row) in enumerate(episode_df.iterrows()):
         frame_id = int(row["frame_id"])
         T_obs, T_gt, depth_real = load_frame_from_manifest(row, args)
         x1, x2, x4 = extract_frame_features(
             T_obs, depth_real, obj_idx, models_pts, scenes, renders_obj, mesh_nodes
         )
 
-        # short-horizon reset：只在非blackout帧进行，避免黑屏中用坏观测reset
-        if args.rollout_horizon > 0 and steps_since_reset >= args.rollout_horizon and x4 != 1:
-            T_B5_history = []
-            steps_since_reset = 0
-
+        # IMPORTANT: no periodic history reset here.
+        # The deployed evaluator also free-runs the same recursive B5 history.
         if len(T_B5_history) < 2:
             T_prior = T_obs
         else:
-            T_prev1 = T_B5_history[-1]
-            T_prev2 = T_B5_history[-2]
-            delta1 = se3_log_map(np.linalg.inv(T_prev2) @ T_prev1)
-            T_prior = T_prev1 @ se3_exp_map(delta1)
+            T_prior = compute_se3_prior(T_B5_history[-1], T_B5_history[-2])
 
         innovation_vec = se3_log_map(np.linalg.inv(T_prior) @ T_obs)
         x3_mag = np.linalg.norm(innovation_vec)
@@ -221,33 +196,35 @@ def rollout_episode(episode_df, seq, obj_idx, args, models_pts, scenes, renders_
 
         if clf_obs.n_features_in_ == 2:
             obs_feat = scaler_obs.transform([[x1, x4]])
+        elif clf_obs.n_features_in_ == 3:
+            obs_feat = scaler_obs.transform([[x1, x2, x4]])
         else:
-            obs_feat = scaler_obs.transform([[x1, x2, x3_mag, x4]])
+            raise ValueError(f"Unexpected obs predictor dimension: {clf_obs.n_features_in_}")
         p_obs_bad = clf_obs.predict_proba(obs_feat)[0, 1]
 
         p_prior_bad = None
         if use_prior_predictor:
-            prior_feat = scaler_prior.transform([[x1, x2, x3_mag, x4]])
+            prior_feat = scaler_prior.transform([[x1, x2, x3_mag, x3_trans, x3_rot, x4]])
             p_prior_bad = clf_prior.predict_proba(prior_feat)[0, 1]
 
-        if x4 == 1:
-            consecutive_blackout += 1
-        else:
-            if consecutive_blackout >= args.blackout_min_frames:
-                exited_blackout = True
-            consecutive_blackout = 0
-
-        T_final_B5, mode = b5_transition(
-            T_obs=T_obs, T_prior=T_prior, p_obs_bad=p_obs_bad, p_prior_bad=p_prior_bad,
-            p_risk_threshold=args.p_risk_threshold, support=x4, exited_blackout=exited_blackout,
-            depth_real=depth_real, model_pts=models_pts[obj_idx],
+        T_final_B5, mode, b5_state, _ = b5_transition(
+            T_obs=T_obs,
+            T_prior=T_prior,
+            p_obs_bad=p_obs_bad,
+            p_prior_bad=p_prior_bad,
+            support=x4,
+            depth_real=depth_real,
+            model_pts=models_pts[obj_idx],
+            K=K,
+            p_risk_threshold=args.p_risk_threshold,
+            frame_index=frame_index,
+            frame_id=frame_id,
+            state=b5_state,
+            blackout_min_frames=args.blackout_min_frames,
             use_prior_predictor=use_prior_predictor
         )
-        if exited_blackout and x4 != 1:
-            exited_blackout = False
 
         T_B5_history.append(T_final_B5)
-        steps_since_reset += 1
 
         rows.append(build_label_row(
             seq, frame_id, T_obs, T_prior, T_gt, obj_idx, d_objs, open3d_models,
@@ -255,17 +232,30 @@ def rollout_episode(episode_df, seq, obj_idx, args, models_pts, scenes, renders_
         ))
     return rows
 
+
 def main(args):
     global ARGS_RISK_THRESHOLD_CM
     ARGS_RISK_THRESHOLD_CM = args.risk_threshold
 
     manifest = pd.read_csv(args.manifest_path)
-    required_cols = {"base_sequence", "condition", "sequence", "frame_id", "depth_path", "gt_path", "pred_path"}
+    print(f"Consuming frozen reference manifest: {args.manifest_path}")
+    required_cols = {
+        "base_sequence", "condition", "sequence", "sequence_index", "frame_id",
+        "rgb_path", "depth_path", "gt_path", "pred_path",
+        "rgb_sha256", "depth_sha256", "gt_sha256", "pred_sha256",
+        "association_method", "association_reference", "association_description",
+    }
     missing_cols = required_cols - set(manifest.columns)
     if missing_cols:
         raise ValueError(f"Manifest缺少字段: {sorted(missing_cols)}")
     if manifest.duplicated(["sequence", "frame_id"]).any():
         raise ValueError("Manifest中存在重复(sequence, frame_id)")
+    if manifest.duplicated(["sequence", "sequence_index"]).any():
+        raise ValueError("Manifest中存在重复(sequence, sequence_index)")
+    association_methods = manifest["association_method"].dropna().unique().tolist()
+    if association_methods != ["official_ycbineoat_reference_sorted_index"]:
+        raise ValueError(f"Manifest association_method不受支持: {association_methods}")
+    verify_manifest_artifacts(manifest, args)
 
     renders_obj, d_objs, scenes, mesh_nodes, models_pts, open3d_models = [], [], [], [], [], []
     for model_seq in args.cad_models_seq[:len(args.target_seqs)]:
@@ -325,11 +315,14 @@ def main(args):
             )
 
     bootstrap_df = pd.DataFrame(bootstrap_rows)
-    feature_cols = ['x1_depth_residual', 'x2_inlier_ratio', 'x3_innovation_mag', 'x4_support_ratio']
+    feature_cols_obs = ['x1_depth_residual', 'x2_inlier_ratio', 'x4_support_ratio']
+    feature_cols_prior = ['x1_depth_residual', 'x2_inlier_ratio', 'x3_innovation_mag',"x3_trans_innovation", "x3_rot_innovation", 'x4_support_ratio']
 
 
-    scaler_full = MinMaxScaler()
-    X_boot = scaler_full.fit_transform(bootstrap_df[feature_cols].values)
+    scaler_obs_full = MinMaxScaler()
+    X_obs_boot = scaler_obs_full.fit_transform(bootstrap_df[feature_cols_obs].values)
+    scaler_prior_full = MinMaxScaler()
+    X_prior_boot = scaler_prior_full.fit_transform(bootstrap_df[feature_cols_prior].values)
 
     y_obs_boot = bootstrap_df['obs_risk_label'].values
     y_prior_boot = bootstrap_df['prior_risk_label'].values
@@ -338,11 +331,11 @@ def main(args):
     if len(np.unique(y_prior_boot)) < 2:
         raise ValueError(
             "bootstrap prior_risk_label只有一个类别，无法训练prior predictor。"
-            "请检查risk_threshold或使用short-horizon reset减小长期漂移。"
+            "请检查risk_threshold或训练数据；不能通过周期性重置B5 history改变部署状态分布。"
         )
 
-    clf_obs_full = LogisticRegression(max_iter=1000).fit(X_boot, y_obs_boot)
-    clf_prior_boot = LogisticRegression(max_iter=1000).fit(X_boot, y_prior_boot)
+    clf_obs_full = LogisticRegression(max_iter=1000).fit(X_obs_boot, y_obs_boot)
+    clf_prior_boot = LogisticRegression(max_iter=1000).fit(X_prior_boot, y_prior_boot)
     print("阶段 2 完成:已得到用于最终label rollout的临时obs/prior predictor。")
 
 
@@ -355,8 +348,8 @@ def main(args):
             episode_df = get_episode_df(manifest, seq)
             csv_rows += rollout_episode(
                 episode_df, seq, obj_idx, args, models_pts, scenes, renders_obj, mesh_nodes,
-                d_objs, open3d_models, clf_obs_full, scaler_full,
-                clf_prior=clf_prior_boot, scaler_prior=scaler_full,
+                d_objs, open3d_models, clf_obs_full, scaler_obs_full,
+                clf_prior=clf_prior_boot, scaler_prior=scaler_prior_full,
                 use_prior_predictor=True
             )
 
@@ -367,8 +360,8 @@ def main(args):
         episode_df = get_episode_df(manifest, seq)
         csv_rows += rollout_episode(
             episode_df, seq, ci_obj_idx, args, models_pts, scenes, renders_obj, mesh_nodes,
-            d_objs, open3d_models, clf_obs_full, scaler_full,
-            clf_prior=clf_prior_boot, scaler_prior=scaler_full,
+            d_objs, open3d_models, clf_obs_full, scaler_obs_full,
+            clf_prior=clf_prior_boot, scaler_prior=scaler_prior_full,
             use_prior_predictor=True
         )
 
@@ -394,7 +387,8 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="生成 YCBInEOAT observation/prior risk labels")
-    parser.add_argument('--manifest_path', type=str, default="./dataset_manifest_all.csv")
+    parser.add_argument('--manifest_path', type=str, default="./reference_manifest.csv",
+                        help="冻结的 reference manifest；本程序不会重建或覆盖它")
     parser.add_argument('--ycb_dir', type=str, default="./datasets/YCBInEOAT", help="GT根目录")
     parser.add_argument('--data_dir', type=str, default="./datasets/YCBInEOAT_Corrupted", help="RGB/Depth根目录")
     parser.add_argument('--res_dir', type=str, default="./results_collection", help="Prediction根目录")
@@ -404,9 +398,8 @@ if __name__ == "__main__":
     parser.add_argument('--ci_object', type=str, default="bleach_hard_00_03_chaitanya")
     parser.add_argument('--ci_episode', nargs='+', default=["_black10_2", "_black10_3", "_black10_4", "_black10_5"])
     parser.add_argument('--cad_models_seq', nargs='+', default=["006_mustard_bottle", "021_bleach_cleanser", "021_bleach_cleanser"])
-    parser.add_argument('--risk_threshold', type=float, default=0.5, help="ADD-S风险阈值(cm)")
+    parser.add_argument('--risk_threshold', type=float, default=1.0, help="ADD-S风险阈值(cm)")
     parser.add_argument('--p_risk_threshold', type=float, default=0.8, help="B5概率决策阈值")
-    parser.add_argument('--rollout_horizon', type=int, default=50, help="short-horizon长度，<=0表示不reset")
     parser.add_argument('--blackout_min_frames', type=int, default=10)
     args = parser.parse_args()
     main(args)
